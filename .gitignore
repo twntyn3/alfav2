@@ -4,9 +4,9 @@ env/
 venv/
 
 # data & indexes & outputs
-data/
-indexes/
-outputs/
+#data/
+#indexes/
+#outputs/
 
 # python cache
 __pycache__/
