@@ -1,6 +1,6 @@
 # alfa
-# alfa
 ```bash
+git clone https://github.com/RUC-NLPIR/FlashRAG.git
 cd FlashRAG
 pip install -e .
 pip install flashrag-dev[full]
