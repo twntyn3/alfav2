@@ -1,6 +1,6 @@
 """Cross-encoder reranker for reordering retrieval candidates."""
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 try:
     from sentence_transformers import CrossEncoder

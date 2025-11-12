@@ -130,6 +130,30 @@ class HybridRetriever:
         else:
             logger.warning("BM25 chunks.jsonl not found")
             self.chunks = None
+
+        # build chunk metadata mappings
+        self.chunk_id_to_index: Dict[str, int] = {}
+        if self.chunks:
+            for idx, chunk in enumerate(self.chunks):
+                chunk_id = chunk.get("id") or chunk.get("chunk_id")
+                if chunk_id is not None:
+                    self.chunk_id_to_index[str(chunk_id)] = idx
+
+            # ensure chunk_ids align with chunk order if missing
+            if not self.chunk_ids:
+                self.chunk_ids = [chunk.get("id", f"chunk_{idx}") for idx, chunk in enumerate(self.chunks)]
+
+            # ensure doc_ids align with chunk order if missing
+            if not self.doc_ids:
+                self.doc_ids = [
+                    chunk.get("doc_id") or (chunk.get("id", "").split("_")[0] if chunk.get("id") else None)
+                    for chunk in self.chunks
+                ]
+        else:
+            if not self.chunk_ids:
+                self.chunk_ids = []
+            if not self.doc_ids:
+                self.doc_ids = []
         
         logger.info(f"Initialized hybrid retriever: dense_weight={weight_dense}, bm25_weight={weight_bm25}")
     
@@ -191,24 +215,77 @@ class HybridRetriever:
             
             # tokenize query using bm25s
             if self.bm25_tokenizer:
-                query_tokens = self.bm25_tokenizer.tokenize([enhanced_query], return_as="tuple", update_vocab=False)
+                query_tokens = self.bm25_tokenizer.tokenize(
+                    [enhanced_query],
+                    return_as="ids",
+                    update_vocab=False
+                )
             else:
-                # simple tokenization
-                query_tokens = bm25s.tokenize([enhanced_query])
+                # simple tokenization using default tokenizer
+                tokenized = bm25s.tokenize(
+                    [enhanced_query],
+                    return_ids=True,
+                    show_progress=False,
+                    leave=False
+                )
+                query_tokens = tokenized.ids if hasattr(tokenized, "ids") else tokenized[0]
             
             # retrieve using bm25s
             results, scores = self.bm25_searcher.retrieve(query_tokens, k=k)
+
+            # convert results to chunk indices
+            indices: List[int] = []
+            filtered_scores: List[float] = []
+            docs: List = []
+            if results is not None and len(results) > 0:
+                docs = results[0]
+                if isinstance(docs, np.ndarray):
+                    docs = docs.tolist()
+            score_entries: List = []
+            if scores is not None and len(scores) > 0:
+                score_entries = scores[0]
+                if isinstance(score_entries, np.ndarray):
+                    score_entries = score_entries.tolist()
+                else:
+                    score_entries = list(score_entries)
+            if score_entries and len(score_entries) != len(docs):
+                score_entries = score_entries[: len(docs)]
+            if not score_entries:
+                score_entries = [0.0] * len(docs)
+
+            for doc, bm25_score in zip(docs, score_entries):
+                appended = False
+                if isinstance(doc, dict):
+                    chunk_id = doc.get("id") or doc.get("chunk_id")
+                    if chunk_id is not None:
+                        chunk_id_str = str(chunk_id)
+                        if chunk_id_str in self.chunk_id_to_index:
+                            indices.append(self.chunk_id_to_index[chunk_id_str])
+                            appended = True
+                        elif self.chunk_ids and chunk_id_str in self.chunk_ids:
+                            indices.append(self.chunk_ids.index(chunk_id_str))
+                            appended = True
+                    doc_id = doc.get("doc_id")
+                    if not appended and doc_id is not None and self.doc_ids:
+                        doc_id_str = str(doc_id)
+                        for idx, existing_doc_id in enumerate(self.doc_ids):
+                            if str(existing_doc_id) == doc_id_str:
+                                indices.append(idx)
+                                appended = True
+                                break
+                else:
+                    try:
+                        indices.append(int(doc))
+                        appended = True
+                    except (TypeError, ValueError):
+                        appended = False
+
+                if appended:
+                    filtered_scores.append(float(bm25_score))
+                else:
+                    logger.debug("Skipped BM25 result without valid chunk mapping")
             
-            # convert to lists
-            if isinstance(results, np.ndarray):
-                indices = results[0].tolist() if len(results) > 0 else []
-            else:
-                indices = list(results[0]) if results else []
-            
-            if isinstance(scores, np.ndarray):
-                score_array = scores[0] if len(scores) > 0 else np.array([])
-            else:
-                score_array = np.array(list(scores[0])) if scores else np.array([])
+            score_array = np.array(filtered_scores, dtype=float)
             
             return indices, score_array
         except Exception as e:
