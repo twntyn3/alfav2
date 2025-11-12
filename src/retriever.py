@@ -215,11 +215,18 @@ class HybridRetriever:
             
             # tokenize query using bm25s
             if self.bm25_tokenizer:
-                query_tokens = self.bm25_tokenizer.tokenize(
+                tokenized_result = self.bm25_tokenizer.tokenize(
                     [enhanced_query],
                     return_as="ids",
                     update_vocab=False
                 )
+                # ensure we have list of lists of ints
+                if isinstance(tokenized_result, list):
+                    query_tokens = tokenized_result
+                elif hasattr(tokenized_result, 'ids'):
+                    query_tokens = tokenized_result.ids
+                else:
+                    query_tokens = [[int(x) for x in tokenized_result]] if tokenized_result else [[]]
             else:
                 # simple tokenization using default tokenizer
                 tokenized = bm25s.tokenize(
@@ -228,7 +235,18 @@ class HybridRetriever:
                     show_progress=False,
                     leave=False
                 )
-                query_tokens = tokenized.ids if hasattr(tokenized, "ids") else tokenized[0]
+                if hasattr(tokenized, "ids"):
+                    query_tokens = tokenized.ids
+                elif isinstance(tokenized, (list, tuple)) and len(tokenized) > 0:
+                    query_tokens = tokenized[0] if isinstance(tokenized[0], list) else [tokenized[0]]
+                else:
+                    query_tokens = [[]]
+            
+            # ensure query_tokens is List[List[int]]
+            if not isinstance(query_tokens, list) or len(query_tokens) == 0:
+                query_tokens = [[]]
+            if not isinstance(query_tokens[0], list):
+                query_tokens = [query_tokens] if isinstance(query_tokens[0], (int, np.integer)) else [[]]
             
             # retrieve using bm25s
             results, scores = self.bm25_searcher.retrieve(query_tokens, k=k)
