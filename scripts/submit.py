@@ -105,11 +105,18 @@ def main():
             batch_size=reranker_config["batch_size"]
         )
     
-    # process questions
+    # process questions with progress bar
     logger.info("Processing questions...")
     results = {}
     
-    for q_id, query in questions:
+    try:
+        from tqdm import tqdm
+        question_iter = tqdm(questions, desc="Processing questions")
+    except ImportError:
+        question_iter = questions
+        logger.warning("tqdm not available, progress bar disabled")
+    
+    for q_id, query in question_iter:
         # retrieve
         candidates = retriever.retrieve(query, k=k_retrieve, return_scores=False)
         
