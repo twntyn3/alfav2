@@ -245,8 +245,36 @@ class HybridRetriever:
             # ensure query_tokens is List[List[int]]
             if not isinstance(query_tokens, list) or len(query_tokens) == 0:
                 query_tokens = [[]]
-            if not isinstance(query_tokens[0], list):
-                query_tokens = [query_tokens] if isinstance(query_tokens[0], (int, np.integer)) else [[]]
+            elif not isinstance(query_tokens[0], list):
+                # if first element is not a list, wrap it
+                if isinstance(query_tokens[0], (int, np.integer)):
+                    query_tokens = [query_tokens]
+                else:
+                    query_tokens = [[]]
+            
+            # validate and normalize: ensure all elements are lists of integers
+            normalized_tokens = []
+            for token_list in query_tokens:
+                if isinstance(token_list, list):
+                    # convert all elements to int
+                    int_list = []
+                    for item in token_list:
+                        try:
+                            int_list.append(int(item))
+                        except (TypeError, ValueError):
+                            pass  # skip non-integer items
+                    normalized_tokens.append(int_list)
+                elif isinstance(token_list, (int, np.integer)):
+                    normalized_tokens.append([int(token_list)])
+                else:
+                    # skip invalid items
+                    pass
+            
+            # ensure we have at least one query (even if empty)
+            if len(normalized_tokens) == 0:
+                normalized_tokens = [[]]
+            
+            query_tokens = normalized_tokens
             
             # retrieve using bm25s
             results, scores = self.bm25_searcher.retrieve(query_tokens, k=k)
