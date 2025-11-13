@@ -11,6 +11,34 @@ try:
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
+try:
+    from flashrag.utils.utils import GPUMisconfigurationError, ensure_cuda_device, get_device
+except ModuleNotFoundError as exc:  # pragma: no cover - runtime environment specific
+    project_root = Path(__file__).resolve().parent.parent
+    flashrag_root = project_root / "FlashRAG"
+    if str(flashrag_root) not in sys.path:
+        sys.path.insert(0, str(flashrag_root))
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    try:
+        from flashrag.utils.utils import GPUMisconfigurationError, ensure_cuda_device, get_device
+    except ModuleNotFoundError as inner_exc:  # pragma: no cover - runtime environment specific
+        if inner_exc.name == "torch":
+            class GPUMisconfigurationError(RuntimeError):
+                """Fallback error when torch is unavailable."""
+
+            def ensure_cuda_device(device_index: int) -> None:
+                raise GPUMisconfigurationError(
+                    "PyTorch is required for CUDA operations but is not installed in the current environment."
+                )
+
+            def get_device() -> str:
+                raise GPUMisconfigurationError(
+                    "PyTorch is required for CUDA operations but is not installed in the current environment."
+                )
+        else:
+            raise
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -82,22 +110,6 @@ def _parse_cuda_device(requested: str) -> Optional[int]:
     return None
 
 
-def _try_cuda_device(device_str: str) -> bool:
-    """Return True if a tiny allocation/sync on the device succeeds."""
-    if torch is None:
-        return False
-    try:
-        idx = _parse_cuda_device(device_str)
-        target = device_str if ":" in device_str else (f"cuda:{idx}" if idx is not None else "cuda")
-        with torch.cuda.device(idx if idx is not None else target):
-            torch.zeros(1, device=target)
-            torch.cuda.synchronize()
-        return True
-    except Exception as exc:  # pragma: no cover - depends on hardware
-        logger.warning("CUDA device %s unavailable (%s); falling back to CPU", device_str, exc)
-        return False
-
-
 def resolve_device(preferred: Optional[str] = None, fallback: str = "cpu") -> str:
     """
     Resolve the best available device given a user preference.
@@ -110,32 +122,26 @@ def resolve_device(preferred: Optional[str] = None, fallback: str = "cpu") -> st
     if pref in {"cpu", "cpu:0"}:
         return "cpu"
 
-    if torch is None or not torch.cuda.is_available():
-        return fallback
+    if torch is None:
+        raise GPUMisconfigurationError("PyTorch is not available; cannot resolve a CUDA device.")
 
-    # handle auto selection
     if pref == "auto":
-        default_device = "cuda"
-        if _try_cuda_device(default_device):
-            idx = _parse_cuda_device(default_device)
-            return f"cuda:{idx}" if idx is not None else "cuda"
-        return fallback
+        return get_device()
 
     if pref.startswith("cuda"):
+        base_device = get_device()
+        if ":" not in pref:
+            return base_device
         idx = _parse_cuda_device(pref)
-        device_str = pref if idx is not None else "cuda"
-        if idx is not None and idx >= torch.cuda.device_count():  # type: ignore[arg-type]
-            logger.warning(
-                "Requested CUDA device %s outside available range (count=%s); falling back to CPU",
-                idx,
-                torch.cuda.device_count(),
+        if idx is None:
+            return base_device
+        if idx >= torch.cuda.device_count():  # type: ignore[arg-type]
+            raise GPUMisconfigurationError(
+                f"Requested CUDA device cuda:{idx} but only {torch.cuda.device_count()} device(s) detected."
             )
-            return fallback
-        if _try_cuda_device(device_str):
-            return device_str if ":" in device_str else f"cuda:{_parse_cuda_device(device_str) or 0}"
-        return fallback
+        ensure_cuda_device(idx)
+        return f"cuda:{idx}"
 
-    # default fallback
     return fallback
 
 

@@ -109,7 +109,7 @@ def read_websites_csv(csv_path: str, validate: bool = True) -> list[Dict[str, st
                 continue
     
     if skipped > 0:
-        logger.warning(f"Skipped {skipped} rows. Reasons: {dict(skipped_reasons)}")
+        logger.info(f"Skipped {skipped} rows. Reasons: {dict(skipped_reasons)}")
     
     logger.info(f"Loaded {len(corpus)} documents from {csv_path}")
     return corpus

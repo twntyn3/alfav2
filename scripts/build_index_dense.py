@@ -15,7 +15,13 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "FlashRAG"))
 
 import yaml
-from flashrag.retriever.index_builder import Index_Builder
+from flashrag.utils.utils import GPUMisconfigurationError
+
+try:
+    from flashrag.retriever.index_builder import Index_Builder
+except GPUMisconfigurationError as exc:
+    print(f"[ERROR] {exc}", file=sys.stderr)
+    sys.exit(1)
 
 from src.utils import load_jsonl, resolve_device
 
@@ -107,5 +113,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except GPUMisconfigurationError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
 

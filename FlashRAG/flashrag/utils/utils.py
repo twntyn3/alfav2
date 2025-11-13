@@ -1,10 +1,13 @@
+import importlib
+import json
 import os
 import re
-import json
-import importlib
-from transformers import AutoConfig
-from flashrag.dataset.dataset import Dataset
+import warnings
+
 import torch
+from transformers import AutoConfig
+
+from flashrag.dataset.dataset import Dataset
 
 def get_dataset(config):
     """Load dataset from config."""
@@ -191,5 +194,81 @@ def extract_between_all(text:str, start_tag:str, end_tag:str):
         return matches
     return None
 
+_CACHED_DEVICE = None
+
+
+class GPUMisconfigurationError(RuntimeError):
+    """Raised when CUDA is requested but the current runtime cannot execute kernels."""
+
+
+def _run_with_warning_capture(fn, *args, **kwargs):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = fn(*args, **kwargs)
+    return result, caught
+
+
+def _emit_and_fail(message: str):
+    warnings.warn(message, RuntimeWarning)
+    raise GPUMisconfigurationError(message)
+
+
+def _check_cuda_kernels(device_index: int) -> None:
+    def _allocate():
+        torch.zeros(1, device=f"cuda:{device_index}")
+        torch.cuda.synchronize(device_index)
+
+    try:
+        _, alloc_warnings = _run_with_warning_capture(_allocate)
+    except Exception as exc:  # pragma: no cover - hardware dependent
+        device_name = torch.cuda.get_device_name(device_index) if torch.cuda.device_count() else f"cuda:{device_index}"
+        _emit_and_fail(
+            f"Failed to execute CUDA kernel on {device_name}: {exc}. "
+            "Install a PyTorch build that supports this GPU architecture."
+        )
+
+    for warn_record in alloc_warnings:
+        message = str(warn_record.message)
+        if "not compatible" in message or "no kernel image" in message or "cuda capability" in message:
+            _emit_and_fail(
+                f"Detected an incompatible CUDA runtime: {message}. "
+                "Install a GPU-enabled PyTorch build that includes kernels for this device."
+            )
+
+
+def ensure_cuda_device(device_index: int) -> None:
+    """Validate that the specified CUDA device can execute kernels."""
+    _check_cuda_kernels(device_index)
+
+
 def get_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    """Return the CUDA device if kernels are available, otherwise halt with an explicit warning."""
+    global _CACHED_DEVICE
+    if _CACHED_DEVICE is not None:
+        return _CACHED_DEVICE
+
+    available, availability_warnings = _run_with_warning_capture(torch.cuda.is_available)
+
+    for warn_record in availability_warnings:
+        message = str(warn_record.message)
+        if "not compatible" in message or "cuda capability" in message:
+            _emit_and_fail(
+                f"CUDA runtime reported an incompatible GPU: {message}. "
+                "Install a PyTorch build compiled for your GPU's compute capability."
+            )
+
+    if not available:
+        _emit_and_fail(
+            "CUDA was requested but torch.cuda.is_available() is False. "
+            "Verify NVIDIA drivers and install a GPU-enabled PyTorch build."
+        )
+
+    try:
+        device_index = torch.cuda.current_device()
+    except Exception:  # pragma: no cover - hardware dependent
+        device_index = 0
+
+    _check_cuda_kernels(device_index)
+
+    _CACHED_DEVICE = f"cuda:{device_index}"
+    return _CACHED_DEVICE

@@ -15,9 +15,12 @@ import torch
 from tqdm import tqdm
 from flashrag.retriever.utils import load_model, load_corpus, pooling, set_default_instruction, judge_zh
 from transformers import AutoTokenizer, AutoModelForMaskedLM
-
 import os
 import multiprocessing
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 cores = str(multiprocessing.cpu_count())
 os.environ["RAYON_NUM_THREADS"] = cores
@@ -106,7 +109,10 @@ class Index_Builder:
                             pooling_method = "mean"
                         break
             except:
-                print(f"Pooling method not found in {self.model_path}, use default pooling method (mean).")
+                logger.debug(
+                    "Pooling method metadata not found for model `%s`; defaulting to mean pooling.",
+                    self.model_path,
+                )
                 # use default pooling method
                 pooling_method = "mean"
         else:
@@ -121,7 +127,7 @@ class Index_Builder:
             os.makedirs(self.save_dir)
         else:
             if not self._check_dir(self.save_dir):
-                warnings.warn("Some files already exists in save dir and may be overwritten.", UserWarning)
+                print("Notice: existing files in the index directory will be overwritten.")
 
         self.embedding_save_path = os.path.join(self.save_dir, f"emb_{self.retrieval_method}.memmap")
 

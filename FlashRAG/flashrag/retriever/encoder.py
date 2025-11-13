@@ -110,8 +110,12 @@ class STEncoder:
         self.use_fp16 = use_fp16
         self.instruction = instruction
         self.silent = silent
+        device = get_device()
         self.model = SentenceTransformer(
-            model_path, trust_remote_code=True, model_kwargs={"torch_dtype": torch.float16 if use_fp16 else torch.float}
+            model_path,
+            trust_remote_code=True,
+            device=device,
+            model_kwargs={"dtype": torch.float16 if use_fp16 else torch.float32},
         )
 
     @torch.inference_mode()
@@ -152,6 +156,7 @@ class ClipEncoder:
 
         self.model_name = model_name
         self.model_path = model_path
+        self.device = get_device()
         self.load_clip_model()
         self.silent = silent
 
@@ -174,7 +179,7 @@ class ClipEncoder:
             raise NotImplementedError(f"Unsupported model type: {model_type}")
 
         self.model.eval()
-        self.model.cuda()
+        self.model.to(self.device)
 
         # set model max length for model that not specified in config.json
         if self.processor is not None and self.processor.tokenizer.model_max_length > 100000:
@@ -216,7 +221,7 @@ class ClipEncoder:
             # need handle image
             image_list = [parse_image(image) for image in image_list]
             inputs = self.processor(images=image_list, return_tensors="pt")
-            inputs = {k: v.cuda() for k, v in inputs.items()}
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             image_emb = self.model.get_image_features(**inputs)
             image_emb = image_emb / image_emb.norm(p=2, dim=-1, keepdim=True)
             image_emb = image_emb.detach().cpu().numpy().astype(np.float32)
@@ -236,7 +241,7 @@ class ClipEncoder:
                 truncation=True,
                 return_tensors="pt",
             )
-            inputs = {k: v.cuda() for k, v in inputs.items()}
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             text_emb = self.model.get_text_features(**inputs)
             text_emb = text_emb / text_emb.norm(p=2, dim=-1, keepdim=True)
             text_emb = text_emb.detach().cpu().numpy().astype(np.float32)
