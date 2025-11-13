@@ -16,26 +16,38 @@ outputs:
   logs_dir: outputs/logs
 
 retrieval:
-  k_retrieve: 30  # retrieve top-k candidates before reranking
-  k_rerank: 20  # number of candidates passed to the reranker
+  k_retrieve: 180  # retrieve top-k candidates before reranking (increased for better recall)
+  k_rerank: 55  # number of candidates passed to the reranker (increased for better quality)
   k_final: 5  # final top-k for submission
-  hybrid_weight_dense: 0.6  # weight for dense vector similarity
-  hybrid_weight_bm25: 0.4  # weight for BM25 score
-  fusion_method: "weighted"  # "weighted" or "rrf" (Reciprocal Rank Fusion)
+  hybrid_weight_dense: 0.6  # weight for dense vector similarity (used only if fusion_method="weighted")
+  hybrid_weight_bm25: 0.4  # weight for BM25 score (used only if fusion_method="weighted")
+  fusion_method: "rrf"  # "weighted" or "rrf" (Reciprocal Rank Fusion) - RRF is more robust
+  rrf_k: 70  # RRF hyperparameter (higher = more weight to top ranks, increased for better precision)
   use_reranker: true  # enable/disable reranking
   enhance_numerics: true  # enhance queries for numeric value matching
-  batch_size: 64  # number of questions processed per retrieval batch (optimized for GPU)
+  min_score_threshold: 0.0  # minimum score threshold before reranking (0.0 = no filtering)
+  filter_by_document_type: false  # filter candidates by document type (has_table, etc.)
+  prefer_table_chunks: false  # prefer chunks with tables for numeric queries
+  batch_size: 32  # number of questions processed per retrieval batch (reduced for stability)
+  reranker_batch_size: 64  # batch size for reranker (increased for GPU efficiency)
   num_workers: 4  # number of parallel threads for batch processing
   prefetch_batches: 2  # number of batches to prefetch ahead
 
 chunking:
-  size_tokens: 600
-  overlap_tokens: 150
+  size_tokens: 280  # reduced for better precision on short banking facts (smaller chunks = better precision)
+  overlap_tokens: 110  # increased for better context preservation (larger overlap = more context)
   add_title_prefix: true
   tokenizer: "o200k_base"  # tokenizer for chunking
   merge_short_paragraphs: true  # merge short paragraphs before chunking
   min_paragraph_length: 50  # minimum characters for standalone paragraph
   use_semantic_chunking: true  # use semantic-structural chunking (tables, headings)
+
+text_processing:
+  normalize_for_retrieval: true  # apply lowercase + normalization for better retrieval
+  normalization_mode: "smart"  # "letters_numbers" (default), "smart", or "aggressive"
+  # letters_numbers: lowercase + letters + digits + spaces (recommended)
+  # smart: keeps letters, digits, spaces, and important symbols (|, %, ., ,, -)
+  # aggressive: only letters and spaces (loses numbers - NOT recommended for banking!)
 
 evaluation:
   metrics: ["hit@5", "recall@5", "recall@10", "mrr", "ndcg@5"]

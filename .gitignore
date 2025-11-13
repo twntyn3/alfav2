@@ -71,3 +71,4 @@ Thumbs.db
 !outputs/submits/.gitkeep
 !outputs/reports/.gitkeep
 !outputs/logs/.gitkeep
+myenv/

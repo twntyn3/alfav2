@@ -24,7 +24,7 @@ while True:
         limit = limit // 10
 
 
-def read_websites_csv(csv_path: str, validate: bool = True) -> list[Dict[str, str]]:
+def read_websites_csv(csv_path: str, validate: bool = True, normalize_for_search: bool = True, normalization_mode: str = "letters_numbers") -> list[Dict[str, str]]:
     """
     Read websites CSV and convert to corpus format with advanced processing.
     
@@ -62,8 +62,8 @@ def read_websites_csv(csv_path: str, validate: bool = True) -> list[Dict[str, st
                     continue
                 
                 # clean and normalize text
-                title = extract_and_clean_title(raw_title)
-                text = extract_and_clean_text(raw_text)
+                title = extract_and_clean_title(raw_title, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
+                text = extract_and_clean_text(raw_text, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
                 
                 # process tables to preserve structure
                 text, has_table = extract_table_structure(text)
@@ -115,16 +115,18 @@ def read_websites_csv(csv_path: str, validate: bool = True) -> list[Dict[str, st
     return corpus
 
 
-def build_corpus(input_csv: str, output_jsonl: str) -> None:
+def build_corpus(input_csv: str, output_jsonl: str, normalize_for_search: bool = True, normalization_mode: str = "letters_numbers") -> None:
     """
     Build corpus JSONL from websites CSV.
     
     Args:
         input_csv: Path to websites_updated.csv
         output_jsonl: Path to output corpus.jsonl
+        normalize_for_search: Apply retrieval normalization
+        normalization_mode: "letters_numbers" (default), "smart", or "aggressive"
     """
     logger.info(f"Building corpus from {input_csv}")
-    corpus = read_websites_csv(input_csv)
+    corpus = read_websites_csv(input_csv, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
     save_jsonl(corpus, output_jsonl)
     logger.info(f"Saved {len(corpus)} documents to {output_jsonl}")
 

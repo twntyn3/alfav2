@@ -453,11 +453,36 @@ class Index_Builder:
         os.makedirs(self.save_dir, exist_ok=True)
 
         corpus = load_corpus(self.corpus_path)
-        # TODO: BM25s not support chinese well
+        # Detect language for proper tokenization
+        from flashrag.retriever.utils import judge_zh, judge_ru
         is_zh = judge_zh(corpus[0]['contents'])
+        is_ru = judge_ru(corpus[0]['contents'])
+        
         if is_zh:
             tokenizer = bm25s.tokenization.Tokenizer(stopwords='zh')
+        elif is_ru:
+            # Russian: use tokenizer without stemmer (bm25s doesn't have Russian stemmer)
+            # Add basic Russian stopwords for better retrieval quality
+            russian_stopwords = [
+                "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все",
+                "она", "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по",
+                "только", "ее", "мне", "было", "вот", "от", "меня", "еще", "нет", "о", "из",
+                "ему", "теперь", "когда", "даже", "ну", "вдруг", "ли", "если", "уже", "или",
+                "ни", "быть", "был", "него", "до", "вас", "нибудь", "опять", "уж", "вам", "ведь",
+                "там", "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть",
+                "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без",
+                "будто", "чего", "раз", "тоже", "себе", "под", "будет", "ж", "тогда", "кто",
+                "этот", "того", "потому", "этого", "какой", "совсем", "ним", "здесь", "этом",
+                "один", "почти", "мой", "тем", "чтобы", "нее", "сейчас", "были", "куда", "зачем",
+                "всех", "никогда", "можно", "при", "наконец", "два", "об", "другой", "хоть",
+                "после", "над", "больше", "тот", "через", "эти", "нас", "про", "всего", "них",
+                "какая", "много", "разве", "три", "эту", "моя", "впрочем", "хорошо", "свою",
+                "этой", "перед", "иногда", "лучше", "чуть", "том", "нельзя", "такой", "им",
+                "более", "всегда", "конечно", "всю", "между"
+            ]
+            tokenizer = bm25s.tokenization.Tokenizer(stopwords=russian_stopwords)
         else:
+            # English or other: use English stemmer
             stemmer = Stemmer.Stemmer("english")
             tokenizer = bm25s.tokenization.Tokenizer(stopwords='en', stemmer=stemmer)
 

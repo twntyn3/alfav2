@@ -1,10 +1,11 @@
-.PHONY: help build_corpus chunk_corpus build_index eval submit clean
+.PHONY: help build_corpus chunk_corpus build_index eval submit clean quick_test
 
 # Default config
 CONFIG ?= configs/base.yaml
 
 help:
 	@echo "Available targets:"
+	@echo "  make quick_test      - Quick test of pipeline (15 min, no full rebuild)"
 	@echo "  make build_corpus    - Build corpus.jsonl from websites CSV"
 	@echo "  make chunk_corpus    - Chunk corpus into smaller pieces"
 	@echo "  make build_index     - Build BM25 index via FlashRAG"
@@ -13,6 +14,10 @@ help:
 	@echo "  make clean           - Clean processed data and indexes"
 	@echo ""
 	@echo "Usage: make <target> CONFIG=configs/base.yaml"
+
+quick_test:
+	@echo "Running quick test (should take ~15 minutes)..."
+	python scripts/quick_test.py --config $(CONFIG)
 
 build_corpus:
 	python scripts/build_corpus.py --config $(CONFIG)

@@ -38,6 +38,14 @@ def judge_zh(input_str: str):
         return False
     #return bool(re.search(r'[\u4e00-\u9fff]', input_str))
 
+def judge_ru(input_str: str):
+    """Detect if input is Russian language."""
+    assert isinstance(input_str, str), input_str
+    if len(input_str) == 0:
+        return False
+    detect_result = langid.classify(input_str)
+    return detect_result[0] == 'ru'
+
 
 def convert_numpy(obj: Union[Dict, list, np.ndarray, np.generic]) -> Any:
     """Recursively convert numpy objects in nested dictionaries or lists to native Python types."""

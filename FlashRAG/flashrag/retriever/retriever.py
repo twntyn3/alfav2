@@ -254,13 +254,45 @@ class BM25Retriever(BaseTextRetriever):
             import bm25s
 
             self.corpus = load_corpus(self.corpus_path)
+            from flashrag.retriever.utils import judge_zh, judge_ru
             is_zh = judge_zh(self.corpus[0]["contents"])
+            is_ru = judge_ru(self.corpus[0]["contents"])
 
             self.searcher = bm25s.BM25.load(self.index_path, mmap=True, load_corpus=False)
             if is_zh:
                 self.tokenizer = bm25s.tokenization.Tokenizer(stopwords="zh")
                 self.tokenizer.load_stopwords(self.index_path)
                 self.tokenizer.load_vocab(self.index_path)
+            elif is_ru:
+                # Russian: load tokenizer without stemmer (should match index builder)
+                # Use same Russian stopwords as in index builder
+                russian_stopwords = [
+                    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все",
+                    "она", "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по",
+                    "только", "ее", "мне", "было", "вот", "от", "меня", "еще", "нет", "о", "из",
+                    "ему", "теперь", "когда", "даже", "ну", "вдруг", "ли", "если", "уже", "или",
+                    "ни", "быть", "был", "него", "до", "вас", "нибудь", "опять", "уж", "вам", "ведь",
+                    "там", "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть",
+                    "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без",
+                    "будто", "чего", "раз", "тоже", "себе", "под", "будет", "ж", "тогда", "кто",
+                    "этот", "того", "потому", "этого", "какой", "совсем", "ним", "здесь", "этом",
+                    "один", "почти", "мой", "тем", "чтобы", "нее", "сейчас", "были", "куда", "зачем",
+                    "всех", "никогда", "можно", "при", "наконец", "два", "об", "другой", "хоть",
+                    "после", "над", "больше", "тот", "через", "эти", "нас", "про", "всего", "них",
+                    "какая", "много", "разве", "три", "эту", "моя", "впрочем", "хорошо", "свою",
+                    "этой", "перед", "иногда", "лучше", "чуть", "том", "нельзя", "такой", "им",
+                    "более", "всегда", "конечно", "всю", "между"
+                ]
+                self.tokenizer = bm25s.tokenization.Tokenizer(stopwords=russian_stopwords)
+                # Load saved stopwords/vocab (will override with saved ones if they exist)
+                try:
+                    self.tokenizer.load_stopwords(self.index_path)
+                except:
+                    pass
+                try:
+                    self.tokenizer.load_vocab(self.index_path)
+                except:
+                    pass
             else:
                 stemmer = Stemmer.Stemmer("english")
                 self.tokenizer = bm25s.tokenization.Tokenizer(stopwords="en", stemmer=stemmer)
@@ -313,7 +345,8 @@ class BM25Retriever(BaseTextRetriever):
         elif self.backend == "bm25s":
             import bm25s
 
-            query_tokens = bm25s.tokenize([query])
+            # Use the same tokenizer that was used for indexing
+            query_tokens = self.tokenizer.tokenize([query], return_as='tuple')
             results, scores = self.searcher.retrieve(query_tokens, k=num)
             raw_idxs = list(results[0])
             raw_scores = [float(s) for s in list(scores[0])]
@@ -340,7 +373,8 @@ class BM25Retriever(BaseTextRetriever):
         elif self.backend == "bm25s":
             import bm25s
 
-            query_tokens = bm25s.tokenize(query)
+            # Use the same tokenizer that was used for indexing
+            query_tokens = self.tokenizer.tokenize(query, return_as='tuple')
             raw_results, raw_scores = self.searcher.retrieve(query_tokens, k=num)
             normalized_results = []
             normalized_scores = []

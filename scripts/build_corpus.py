@@ -44,13 +44,19 @@ def main():
         config = load_config(args.config)
         input_csv = args.input or config["data"]["raw_websites"]
         output_jsonl = args.output or config["data"]["corpus_jsonl"]
+        # Get normalization settings from config
+        text_processing = config.get("text_processing", {})
+        normalize_for_search = text_processing.get("normalize_for_retrieval", True)
+        normalization_mode = text_processing.get("normalization_mode", "smart")
     else:
         if not args.input or not args.output:
             parser.error("Either --config or both --input and --output must be provided")
         input_csv = args.input
         output_jsonl = args.output
+        normalize_for_search = True
+        normalization_mode = "letters_numbers"
     
-    build_corpus(input_csv, output_jsonl)
+    build_corpus(input_csv, output_jsonl, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
 
 
 if __name__ == "__main__":

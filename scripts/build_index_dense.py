@@ -62,6 +62,34 @@ def main():
     print(f"  Save dir: {save_dir}")
     print(f"  FAISS type: {faiss_config['index_type']}")
     
+    # Determine pooling method before building index (to save in metadata)
+    # This matches the auto-detection logic in Index_Builder
+    pooling_method = None
+    if pooling_method is None:
+        try:
+            import json
+            import os
+            pooling_config_path = os.path.join(model_path, "1_Pooling/config.json")
+            if os.path.exists(pooling_config_path):
+                pooling_config = json.load(open(pooling_config_path))
+                for k, v in pooling_config.items():
+                    if k.startswith("pooling_mode") and v == True:
+                        pooling_method = k.split("pooling_mode_")[-1]
+                        if pooling_method == "mean_tokens":
+                            pooling_method = "mean"
+                        elif pooling_method == "cls_token":
+                            pooling_method = "cls"
+                        else:
+                            pooling_method = "mean"
+                        break
+        except:
+            pass
+    if pooling_method is None:
+        pooling_method = "mean"  # default
+    
+    # Determine instruction (auto-detect for E5/BGE)
+    instruction = None  # Will be auto-detected by FlashRAG
+    
     # create index builder
     index_builder = Index_Builder(
         retrieval_method="e5",  # will be auto-detected from model
@@ -71,8 +99,8 @@ def main():
         max_length=512,
         batch_size=embeddings_config.get("batch_size", 32),
         use_fp16=use_fp16,
-        pooling_method=None,  # auto-detect
-        instruction=None,  # auto-detect for E5/BGE
+        pooling_method=pooling_method,  # use detected pooling method
+        instruction=instruction,  # auto-detect for E5/BGE
         faiss_type=faiss_config["index_type"],
         faiss_gpu=faiss_gpu_enabled,
         use_sentence_transformer=True,  # use sentence-transformers for easier setup
@@ -95,7 +123,7 @@ def main():
         chunk_ids.append(chunk_id)
         doc_ids.append(doc_id)
     
-    # save metadata
+    # save metadata (including pooling_method and instruction for consistency)
     import json
     meta_path = Path(save_dir) / "faiss_meta.json"
     metadata = {
@@ -103,7 +131,10 @@ def main():
         "doc_ids": doc_ids,
         "num_chunks": len(chunk_ids),
         "model_name": model_path,
-        "faiss_type": faiss_config["index_type"]
+        "faiss_type": faiss_config["index_type"],
+        "pooling_method": pooling_method,  # Save for consistency with retrieval
+        "max_length": 512,  # Document max length used during indexing
+        "instruction": instruction  # Save instruction (None = auto-detect)
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)

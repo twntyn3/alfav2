@@ -1,23 +1,34 @@
 # Model configurations for embeddings, reranking, and tokenization
 
 embeddings:
-  model_name: "intfloat/multilingual-e5-base"
+  model_name: "intfloat/multilingual-e5-large"  # upgraded from base for better embeddings
   # alternatives: 
+  # - "intfloat/multilingual-e5-base" (faster, less accurate)
   # - "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-  # - "intfloat/multilingual-e5-large"
   device: "auto"          # must resolve to CUDA; raises if kernels absent
-  batch_size: 128         # optimized batch size for GPU throughput
+  batch_size: 64          # reduced batch size for large model (was 128 for base)
   normalize_embeddings: true
   use_fp16: true          # enable half precision on GPU
 
 reranker:
-  model_name: "cross-encoder/ms-marco-MiniLM-L-12-v2"
+  model_name: "BAAI/bge-reranker-base"  # multilingual reranker (upgraded from ms-marco)
   # alternatives:
+  # - "cross-encoder/ms-marco-MiniLM-L-12-v2" (English only, faster)
   # - "cross-encoder/ms-marco-MiniLM-L-6-v2" (faster, less accurate)
-  # - "BAAI/bge-reranker-base" (multilingual)
   device: "auto"
   batch_size: 64          # optimized batch size for GPU
+  max_length: 512         # max sequence length for reranker (must match model's max_length)
   use_fp16: true
+  
+# Ensemble rerankers (optional, for advanced accuracy)
+reranker_ensemble:
+  enabled: false  # set to true to use ensemble of multiple rerankers
+  models:
+    - "BAAI/bge-reranker-base"
+    - "cross-encoder/ms-marco-MiniLM-L-12-v2"
+  weights: [0.7, 0.3]  # weights for ensemble (sum should be 1.0)
+  second_pass: false  # enable second pass reranking on top candidates
+  second_pass_topk: 20  # number of candidates for second pass
 
 tokenizer:
   name: "o200k_base"

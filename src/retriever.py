@@ -32,8 +32,13 @@ class HybridRetriever:
         query_batch_size: int = 32,
         weight_dense: float = 0.6,
         weight_bm25: float = 0.4,
-        fusion_method: str = "weighted",
+        fusion_method: str = "rrf",
+        rrf_k: int = 60,
         enhance_numerics: bool = True,
+        normalization_mode: str = "smart",  # normalization mode for queries
+        min_score_threshold: float = 0.0,  # minimum score threshold before reranking
+        filter_by_document_type: bool = False,  # filter candidates by document type
+        prefer_table_chunks: bool = False,  # prefer chunks with tables for numeric queries
         embedding_fp16: bool = True,
         faiss_use_gpu: bool = True,
         faiss_gpu_device: Optional[int] = None,  # kept for API compatibility
@@ -47,17 +52,38 @@ class HybridRetriever:
         self.embedding_model_name = embedding_model_name
         self.query_batch_size = max(1, int(query_batch_size))
         self.fusion_method = fusion_method
+        self.rrf_k = int(rrf_k)
         self.weight_dense = float(weight_dense)
         self.weight_bm25 = float(weight_bm25)
         self.enhance_numerics = enhance_numerics
+        self.normalization_mode = normalization_mode
+        self.min_score_threshold = float(min_score_threshold)
+        self.filter_by_document_type = bool(filter_by_document_type)
+        self.prefer_table_chunks = bool(prefer_table_chunks)
         self.embedding_fp16 = bool(embedding_fp16)
         self.faiss_use_gpu = bool(faiss_use_gpu)
         self.faiss_use_fp16 = bool(faiss_use_fp16)
-        self.default_topk = 50
+        self.default_topk = 200  # Increased to support k_retrieve=180
 
         self.faiss_index_path = Path(faiss_index_path)
         if not self.faiss_index_path.exists():
             raise FileNotFoundError(f"FAISS index not found: {self.faiss_index_path}")
+        
+        # Load FAISS metadata to get pooling_method and other settings
+        self.faiss_pooling_method = None
+        faiss_meta_path = self.faiss_index_path.parent / "faiss_meta.json"
+        if faiss_meta_path.exists():
+            try:
+                import json
+                with open(faiss_meta_path, "r", encoding="utf-8") as f:
+                    faiss_meta = json.load(f)
+                    self.faiss_pooling_method = faiss_meta.get("pooling_method", "mean")
+            except Exception as e:
+                logger.warning(f"Could not load FAISS metadata: {e}, using default pooling_method='mean'")
+                self.faiss_pooling_method = "mean"
+        else:
+            logger.warning(f"FAISS metadata not found at {faiss_meta_path}, using default pooling_method='mean'")
+            self.faiss_pooling_method = "mean"
 
         self.bm25_index_dir = Path(bm25_index_dir)
         if not self.bm25_index_dir.exists():
@@ -122,9 +148,28 @@ class HybridRetriever:
                 if isinstance(candidate_scores, list):
                     raw_scores = candidate_scores
             candidates: List[Dict[str, Any]] = []
+            # Get original query (before normalization) for numeric detection
+            original_query = queries[idx] if idx < len(queries) else ""
+            is_numeric_query = self._is_numeric_query(original_query)
+            
             for doc_idx, doc in enumerate(docs[:topk]):
                 fallback_score = raw_scores[doc_idx] if doc_idx < len(raw_scores) else None
-                candidates.append(self._to_candidate(doc, fallback_score))
+                candidate = self._to_candidate(doc, fallback_score)
+                
+                # Filter by minimum score threshold if enabled
+                if self.min_score_threshold > 0.0 and candidate["score"] < self.min_score_threshold:
+                    continue
+                
+                # Filter/prefer by document type if enabled
+                if self.filter_by_document_type or self.prefer_table_chunks:
+                    has_table = candidate.get("has_table", False) or self._detect_table_in_candidate(candidate)
+                    candidate["has_table"] = has_table
+                    
+                    # Prefer table chunks for numeric queries
+                    if self.prefer_table_chunks and is_numeric_query and has_table:
+                        candidate["score"] = candidate["score"] * 1.2  # Boost score by 20%
+                
+                candidates.append(candidate)
             processed_results.append(candidates)
             if return_scores:
                 processed_scores.append(
@@ -144,9 +189,17 @@ class HybridRetriever:
     # --------------------------------------------------------------------- #
 
     def _prepare_queries(self, queries: List[str]) -> List[str]:
-        if not self.enhance_numerics:
-            return queries
-        return [enhance_query_for_numerics(q) for q in queries]
+        from src.text_processor import normalize_for_retrieval
+        
+        prepared = []
+        for query in queries:
+            # Apply numeric enhancement if enabled
+            if self.enhance_numerics:
+                query = enhance_query_for_numerics(query)
+            # Normalize query to match corpus normalization
+            query = normalize_for_retrieval(query, mode=self.normalization_mode)
+            prepared.append(query)
+        return prepared
 
     def _normalized_weights(self) -> Dict[str, float]:
         raw = {
@@ -171,6 +224,7 @@ class HybridRetriever:
         bm25_config = {
             "name": "bm25",
             "retrieval_method": "bm25",
+            "retrieval_model_path": "",  # Not used for BM25, but required by FlashRAG
             "retrieval_topk": self.default_topk,
             "retrieval_batch_size": self.query_batch_size,
             "retrieval_query_max_length": 256,
@@ -193,10 +247,10 @@ class HybridRetriever:
             "retrieval_model_path": self.embedding_model_name,
             "retrieval_topk": self.default_topk,
             "retrieval_batch_size": self.query_batch_size,
-            "retrieval_query_max_length": 256,
+            "retrieval_query_max_length": 256,  # Queries are shorter than documents
             "retrieval_use_fp16": self.embedding_fp16 or self.faiss_use_fp16,
-            "retrieval_pooling_method": "mean",
-            "instruction": None,
+            "retrieval_pooling_method": self.faiss_pooling_method,  # Use pooling_method from index metadata
+            "instruction": None,  # Auto-detect (will use "query: " for E5, "passage: " was used during indexing)
             "index_path": str(self.faiss_index_path),
             "corpus_path": str(self.bm25_corpus_path),
             "save_retrieval_cache": False,
@@ -208,15 +262,22 @@ class HybridRetriever:
             "faiss_gpu": self.faiss_use_gpu,
         }
 
+        multi_retriever_setting = {
+            "merge_method": merge_method,
+            "topk": self.default_topk,
+            "retriever_list": [bm25_config, dense_config],
+        }
+        if merge_method == "weighted":
+            multi_retriever_setting["weights"] = weights
+        elif merge_method == "rrf":
+            # FlashRAG uses k=60 by default, but we allow customization
+            # The rrf_k is passed via the router's internal rrf_merge method
+            pass  # RRF k is handled internally by FlashRAG
+        
         return {
             "device": self.device,
             "silent_retrieval": True,
-            "multi_retriever_setting": {
-                "merge_method": merge_method,
-                "weights": weights,
-                "topk": self.default_topk,
-                "retriever_list": [bm25_config, dense_config],
-            },
+            "multi_retriever_setting": multi_retriever_setting,
         }
 
     def _resolve_bm25_index_path(self) -> Path:
@@ -258,6 +319,26 @@ class HybridRetriever:
             "contents": doc.get("contents") or doc.get("text") or "",
             "source_scores": {key: float(value) for key, value in source_scores.items()},
             "sources": doc.get("sources", []),
+            "has_table": doc.get("has_table", False),
         }
         return candidate
+    
+    @staticmethod
+    def _is_numeric_query(query: str) -> bool:
+        """Check if query contains numeric patterns (numbers, rates, amounts, etc.)."""
+        import re
+        # Check for numbers
+        if re.search(r'\d+', query):
+            return True
+        # Check for numeric-related terms
+        numeric_terms = ["процент", "ставка", "сумма", "лимит", "комиссия", "курс", "цена", "стоимость"]
+        query_lower = query.lower()
+        return any(term in query_lower for term in numeric_terms)
+    
+    @staticmethod
+    def _detect_table_in_candidate(candidate: Dict[str, Any]) -> bool:
+        """Detect if candidate contains table structure."""
+        from src.table_processor import detect_table
+        contents = candidate.get("contents") or candidate.get("text") or ""
+        return detect_table(contents)
 

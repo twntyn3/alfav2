@@ -18,6 +18,7 @@ import yaml
 import csv
 from src.retriever import HybridRetriever
 from src.reranker import Reranker
+from src.reranker_ensemble import RerankerEnsemble
 from src.utils import logger, resolve_device
 
 
@@ -78,6 +79,10 @@ def main():
     bm25_corpus_path = bm25_corpus_override or str(Path(bm25_dir) / "chunks.jsonl")
     embeddings_config = models_config["embeddings"]
     embedding_device = resolve_device(embeddings_config.get("device", "auto"))
+    # Get normalization mode from config
+    text_processing = config.get("text_processing", {})
+    normalization_mode = text_processing.get("normalization_mode", "smart")
+    
     retriever = HybridRetriever(
         faiss_index_path=str(faiss_index_path),
         faiss_meta_path=str(faiss_meta_path) if faiss_meta_path else None,
@@ -90,7 +95,12 @@ def main():
         weight_dense=retrieval_config.get("hybrid_weight_dense", 0.6),
         weight_bm25=retrieval_config.get("hybrid_weight_bm25", 0.4),
         fusion_method=retrieval_config.get("fusion_method", "weighted"),
+        rrf_k=retrieval_config.get("rrf_k", 60),
         enhance_numerics=retrieval_config.get("enhance_numerics", True),
+        normalization_mode=normalization_mode,
+        min_score_threshold=retrieval_config.get("min_score_threshold", 0.0),
+        filter_by_document_type=retrieval_config.get("filter_by_document_type", False),
+        prefer_table_chunks=retrieval_config.get("prefer_table_chunks", False),
         embedding_fp16=embeddings_config.get("use_fp16", False),
         faiss_use_gpu=faiss_config.get("use_gpu", False),
         faiss_gpu_device=faiss_config.get("gpu_device"),
@@ -106,6 +116,7 @@ def main():
             model_name=reranker_config["model_name"],
             device=reranker_device,
             batch_size=reranker_config.get("batch_size", 16),
+            max_length=reranker_config.get("max_length", 512),
             use_fp16=reranker_config.get("use_fp16", False),
         )
     

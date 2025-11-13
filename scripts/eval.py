@@ -24,6 +24,7 @@ from src.batch_processor import optimize_batch_size
 from src.evaluator import RetrievalEvaluator
 from src.failure_logger import FailureLogger
 from src.reranker import Reranker
+from src.reranker_ensemble import RerankerEnsemble
 from src.retriever import HybridRetriever
 from src.utils import get_timestamp, logger, resolve_device
 
@@ -95,6 +96,10 @@ def main():
     bm25_corpus_path = bm25_corpus_override or str(Path(bm25_dir) / "chunks.jsonl")
     embeddings_config = models_config["embeddings"]
     embedding_device = resolve_device(embeddings_config.get("device", "auto"))
+    # Get normalization mode from config
+    text_processing = config.get("text_processing", {})
+    normalization_mode = text_processing.get("normalization_mode", "smart")
+    
     retriever = HybridRetriever(
         faiss_index_path=str(faiss_index_path),
         faiss_meta_path=str(faiss_meta_path) if faiss_meta_path else None,
@@ -106,30 +111,57 @@ def main():
         query_batch_size=retrieval_config.get("batch_size", embeddings_config.get("batch_size", 32)),
         weight_dense=retrieval_config.get("hybrid_weight_dense", 0.6),
         weight_bm25=retrieval_config.get("hybrid_weight_bm25", 0.4),
-        fusion_method=retrieval_config.get("fusion_method", "weighted"),
+        fusion_method=retrieval_config.get("fusion_method", "rrf"),
+        rrf_k=retrieval_config.get("rrf_k", 60),
         enhance_numerics=retrieval_config.get("enhance_numerics", True),
+        normalization_mode=normalization_mode,
+        min_score_threshold=retrieval_config.get("min_score_threshold", 0.0),
+        filter_by_document_type=retrieval_config.get("filter_by_document_type", False),
+        prefer_table_chunks=retrieval_config.get("prefer_table_chunks", False),
         embedding_fp16=embeddings_config.get("use_fp16", False),
         faiss_use_gpu=faiss_config.get("use_gpu", False),
         faiss_gpu_device=faiss_config.get("gpu_device"),
         faiss_use_fp16=faiss_config.get("use_float16", False),
     )
     
-    # initialize reranker if enabled
+    # initialize reranker if enabled (single or ensemble)
     reranker = None
     if use_reranker:
-        logger.info("Initializing reranker...")
         reranker_device = resolve_device(reranker_config.get("device", "auto"))
-        reranker = Reranker(
-            model_name=reranker_config["model_name"],
-            device=reranker_device,
-            batch_size=reranker_config.get("batch_size", 16),
-            use_fp16=reranker_config.get("use_fp16", False),
-        )
+        ensemble_config = models_config.get("reranker_ensemble", {})
+        
+        if ensemble_config.get("enabled", False):
+            logger.info("Initializing ensemble reranker...")
+            reranker = RerankerEnsemble(
+                model_names=ensemble_config.get("models", [reranker_config["model_name"]]),
+                weights=ensemble_config.get("weights"),
+                device=reranker_device,
+                batch_size=retrieval_config.get("reranker_batch_size", reranker_config.get("batch_size", 64)),
+                max_length=reranker_config.get("max_length", 512),
+                use_fp16=reranker_config.get("use_fp16", False),
+                second_pass=ensemble_config.get("second_pass", False),
+                second_pass_topk=ensemble_config.get("second_pass_topk", 20),
+            )
+        else:
+            logger.info("Initializing single reranker...")
+            reranker = Reranker(
+                model_name=reranker_config["model_name"],
+                device=reranker_device,
+                batch_size=retrieval_config.get("reranker_batch_size", reranker_config.get("batch_size", 64)),
+                max_length=reranker_config.get("max_length", 512),
+                use_fp16=reranker_config.get("use_fp16", False),
+            )
     
     # initialize evaluator
     evaluator = RetrievalEvaluator()
-    if args.ground_truth:
-        evaluator.load_ground_truth(args.ground_truth)
+    # Load ground truth from command line arg or config
+    ground_truth_path = args.ground_truth or config.get("evaluation", {}).get("ground_truth_path")
+    if ground_truth_path:
+        ground_truth_path = Path(ground_truth_path)
+        if ground_truth_path.exists():
+            evaluator.load_ground_truth(str(ground_truth_path))
+        else:
+            logger.warning(f"Ground truth file not found: {ground_truth_path}")
     
     # initialize failure logger
     failure_logger = FailureLogger(evaluator.ground_truth)
@@ -185,6 +217,18 @@ def main():
             batch_scores = [{} for _ in batch]
         
         original_candidates = [copy.deepcopy(cands) for cands in batch_candidates]
+        
+        # Diagnostic: compute recall@50 before reranking if ground truth available
+        if evaluator.ground_truth and batch_start == 0:
+            recall_at_50_before_rerank = 0.0
+            for local_idx, (q_id, _) in enumerate(batch):
+                if q_id in evaluator.ground_truth:
+                    retrieved_web_ids = [int(c.get("doc_id", 0)) for c in batch_candidates[local_idx][:50]]
+                    recall_at_50_before_rerank += evaluator.recall_at_k(q_id, retrieved_web_ids, k=50)
+            if len(batch) > 0:
+                recall_at_50_before_rerank /= len(batch)
+                logger.info(f"Diagnostic: Recall@50 before rerank (first batch): {recall_at_50_before_rerank:.4f}")
+        
         reranked_batch = [cands[:k_final] for cands in batch_candidates]
         
         if reranker:
@@ -245,12 +289,52 @@ def main():
                 batch_logs.append(log_entry_after)
             
             final_candidates = reranked_candidates if reranker else candidates[:k_final]
-            web_ids = [int(c["doc_id"]) for c in final_candidates[:k_final]]
-            if len(web_ids) < k_final and candidates:
-                additional = [int(c["doc_id"]) for c in candidates[k_final:]]
-                web_ids.extend(additional[: k_final - len(web_ids)])
+            
+            # Deduplicate by web_id: keep best chunk per document (same as submit.py)
+            web_id_to_best_chunk = {}
+            for candidate in final_candidates:
+                try:
+                    doc_id = int(candidate.get("doc_id", 0))
+                    if doc_id <= 0:
+                        continue
+                    # Keep candidate with highest score for each web_id
+                    if doc_id not in web_id_to_best_chunk:
+                        web_id_to_best_chunk[doc_id] = candidate
+                    else:
+                        current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
+                        best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
+                        if current_score > best_score:
+                            web_id_to_best_chunk[doc_id] = candidate
+                except (ValueError, TypeError):
+                    continue
+            
+            # If we still need more, fill from original candidates
+            if len(web_id_to_best_chunk) < k_final:
+                for candidate in candidates:
+                    try:
+                        doc_id = int(candidate.get("doc_id", 0))
+                        if doc_id <= 0 or doc_id in web_id_to_best_chunk:
+                            continue
+                        web_id_to_best_chunk[doc_id] = candidate
+                        if len(web_id_to_best_chunk) >= k_final:
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            
+            # Sort by score and take top-k
+            deduped_candidates = sorted(
+                web_id_to_best_chunk.values(),
+                key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
+                reverse=True
+            )[:k_final]
+            
+            web_ids = [int(c["doc_id"]) for c in deduped_candidates]
+            # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
             while len(web_ids) < k_final:
-                web_ids.append(web_ids[-1] if web_ids else 1)
+                if web_ids:
+                    web_ids.append(web_ids[-1])  # Duplicate last
+                else:
+                    web_ids.append(1)  # Fallback
             web_ids = web_ids[:k_final]
             batch_results[q_id] = web_ids
             
@@ -337,7 +421,13 @@ def main():
         logger.info(f"Recall@5: {metrics.get('recall@5', 0):.4f}")
         logger.info(f"MRR: {metrics.get('mrr', 0):.4f}")
     else:
-        logger.warning("No ground truth provided, skipping evaluation")
+        logger.info(
+            "No ground truth provided. Metrics will not be computed. "
+            "To enable evaluation, specify ground truth via:\n"
+            "  - Command line: --ground_truth <path_to_ground_truth.json>\n"
+            "  - Config file: evaluation.ground_truth_path in configs/base.yaml\n"
+            "  Format: JSON file with {\"q_id\": [web_id, ...]} mapping"
+        )
     
     # save report
     timestamp = get_timestamp()

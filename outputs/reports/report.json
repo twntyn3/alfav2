@@ -1,6 +1,0 @@
-{
-  "ts": 1762813887,
-  "k_retrieve": 50,
-  "k_final": 5,
-  "notes": "TODO attach FAISS+BM25+CrossEncoder"
-}

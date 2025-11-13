@@ -136,13 +136,67 @@ def extract_numeric_values(text: str) -> List[Dict[str, str]]:
 
 def enhance_query_for_numerics(query: str) -> str:
     """
-    Enhance query to better match numeric values.
+    Enhance query to better match numeric values and banking terms.
     
-    Adds variations of numeric patterns to improve BM25 matching.
+    Adds variations of numeric patterns, banking synonyms, and query expansion
+    to improve BM25 and dense retrieval matching.
     """
     enhanced = query
     
-    # Extract numbers from query
+    # Extended banking domain synonyms and expansions
+    banking_synonyms = {
+        "счет": ["счет", "счёт", "аккаунт", "account", "банковский счет"],
+        "карта": ["карта", "card", "кредитная карта", "дебетовая карта", "пластиковая карта"],
+        "кредит": ["кредит", "займ", "loan", "кредитная линия", "кредитование"],
+        "вклад": ["вклад", "депозит", "deposit", "сберегательный счет"],
+        "платеж": ["платеж", "платёж", "оплата", "payment", "транзакция", "перевод средств"],
+        "перевод": ["перевод", "transfer", "трансфер", "перечисление", "перевод денег"],
+        "бик": ["бик", "bik", "банковский идентификационный код", "банковский код"],
+        "реквизиты": ["реквизиты", "details", "банковские реквизиты", "платежные реквизиты"],
+        "отделение": ["отделение", "офис", "банк", "branch", "office", "филиал", "банковское отделение"],
+        "смс": ["смс", "sms", "сообщение", "код подтверждения", "смс-уведомление"],
+        "онлайн": ["онлайн", "online", "интернет-банк", "мобильный банк", "интернет банкинг"],
+        "номер": ["номер", "number", "num", "номер счета", "номер карты"],
+        "узнать": ["узнать", "найти", "посмотреть", "проверить", "find", "check", "уточнить"],
+        "получить": ["получить", "get", "заказать", "оформить", "выпустить"],
+        "процент": ["процент", "ставка", "rate", "процентная ставка", "годовая ставка"],
+        "комиссия": ["комиссия", "fee", "плата", "стоимость", "тариф"],
+        "лимит": ["лимит", "limit", "ограничение", "максимум"],
+        "баланс": ["баланс", "balance", "остаток", "остаток средств"],
+        "выписка": ["выписка", "statement", "отчет", "история операций"],
+        "кэшбэк": ["кэшбэк", "cashback", "возврат", "бонус"],
+    }
+    
+    # Query rewriting patterns (common question reformulations)
+    query_rewrites = {
+        "как": ["как", "способ", "метод", "инструкция"],
+        "где": ["где", "место", "адрес", "локация"],
+        "когда": ["когда", "время", "срок", "дата"],
+        "сколько": ["сколько", "сумма", "размер", "объем"],
+        "можно": ["можно", "возможно", "разрешено", "доступно"],
+        "нужно": ["нужно", "необходимо", "требуется", "надо"],
+    }
+    
+    # Add synonyms for key banking terms
+    query_lower = query.lower()
+    added_synonyms = set()
+    
+    for key, synonyms in banking_synonyms.items():
+        if key in query_lower:
+            for synonym in synonyms[:3]:  # Add first 3 synonyms
+                if synonym not in query_lower and synonym not in added_synonyms:
+                    enhanced += f" {synonym}"
+                    added_synonyms.add(synonym)
+    
+    # Add query rewriting patterns
+    for pattern, rewrites in query_rewrites.items():
+        if pattern in query_lower:
+            for rewrite in rewrites[:2]:  # Add first 2 rewrites
+                if rewrite not in query_lower and rewrite not in added_synonyms:
+                    enhanced += f" {rewrite}"
+                    added_synonyms.add(rewrite)
+    
+    # Extract numbers from query and add variations
     numbers = re.findall(r'\d+[.,]?\d*', query)
     for num in numbers:
         # Add variations: with/without spaces, with/without decimal
@@ -154,6 +208,24 @@ def enhance_query_for_numerics(query: str) -> str:
         else:
             # Add decimal versions
             enhanced += f" {num}.0 {num},0"
+    
+    # Add common banking query patterns
+    if any(word in query_lower for word in ["где", "как", "какой", "что"]):
+        # Add "информация" and "помощь" for informational queries
+        if "информация" not in enhanced.lower():
+            enhanced += " информация"
+        if "условия" not in enhanced.lower() and any(w in query_lower for w in ["кредит", "вклад", "карта"]):
+            enhanced += " условия"
+    
+    # Remove extra spaces and limit length
+    enhanced = re.sub(r'\s+', ' ', enhanced).strip()
+    # Limit to reasonable length (keep original + ~100 chars expansion)
+    if len(enhanced) > len(query) + 150:
+        # Keep original query + first 30 words of expansion
+        words = enhanced.split()
+        original_words = query.split()
+        max_expansion_words = 30
+        enhanced = " ".join(original_words + words[len(original_words):len(original_words) + max_expansion_words])
     
     return enhanced
 

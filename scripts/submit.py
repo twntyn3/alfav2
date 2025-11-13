@@ -23,6 +23,7 @@ import yaml
 from src.batch_processor import BatchProcessor, optimize_batch_size
 from src.retriever import HybridRetriever
 from src.reranker import Reranker
+from src.reranker_ensemble import RerankerEnsemble
 from src.utils import logger, get_timestamp, resolve_device
 def validate_against_sample(results: Dict[int, List[int]], sample_path: Path, k_final: int) -> None:
     """Ensure submission matches the sample format (q_ids set and list length)."""
@@ -120,6 +121,10 @@ def main():
     bm25_corpus_path = bm25_corpus_override or str(Path(bm25_dir) / "chunks.jsonl")
     embeddings_config = models_config["embeddings"]
     embedding_device = resolve_device(embeddings_config.get("device", "auto"))
+    # Get normalization mode from config
+    text_processing = config.get("text_processing", {})
+    normalization_mode = text_processing.get("normalization_mode", "smart")
+    
     retriever = HybridRetriever(
         faiss_index_path=str(faiss_index_path),
         faiss_meta_path=str(faiss_meta_path) if faiss_meta_path else None,
@@ -131,25 +136,46 @@ def main():
         query_batch_size=retrieval_config.get("batch_size", embeddings_config.get("batch_size", 32)),
         weight_dense=retrieval_config.get("hybrid_weight_dense", 0.6),
         weight_bm25=retrieval_config.get("hybrid_weight_bm25", 0.4),
-        fusion_method=retrieval_config.get("fusion_method", "weighted"),
+        fusion_method=retrieval_config.get("fusion_method", "rrf"),
+        rrf_k=retrieval_config.get("rrf_k", 60),
         enhance_numerics=retrieval_config.get("enhance_numerics", True),
+        normalization_mode=normalization_mode,
+        min_score_threshold=retrieval_config.get("min_score_threshold", 0.0),
+        filter_by_document_type=retrieval_config.get("filter_by_document_type", False),
+        prefer_table_chunks=retrieval_config.get("prefer_table_chunks", False),
         embedding_fp16=embeddings_config.get("use_fp16", False),
         faiss_use_gpu=faiss_config.get("use_gpu", False),
         faiss_gpu_device=faiss_config.get("gpu_device"),
         faiss_use_fp16=faiss_config.get("use_float16", False),
     )
     
-    # initialize reranker if enabled
+    # initialize reranker if enabled (single or ensemble)
     reranker = None
     if use_reranker:
-        logger.info("Initializing reranker...")
         reranker_device = resolve_device(reranker_config.get("device", "auto"))
-        reranker = Reranker(
-            model_name=reranker_config["model_name"],
-            device=reranker_device,
-            batch_size=reranker_config.get("batch_size", 16),
-            use_fp16=reranker_config.get("use_fp16", False),
-        )
+        ensemble_config = models_config.get("reranker_ensemble", {})
+        
+        if ensemble_config.get("enabled", False):
+            logger.info("Initializing ensemble reranker...")
+            reranker = RerankerEnsemble(
+                model_names=ensemble_config.get("models", [reranker_config["model_name"]]),
+                weights=ensemble_config.get("weights"),
+                device=reranker_device,
+                batch_size=retrieval_config.get("reranker_batch_size", reranker_config.get("batch_size", 64)),
+                max_length=reranker_config.get("max_length", 512),
+                use_fp16=reranker_config.get("use_fp16", False),
+                second_pass=ensemble_config.get("second_pass", False),
+                second_pass_topk=ensemble_config.get("second_pass_topk", 20),
+            )
+        else:
+            logger.info("Initializing single reranker...")
+            reranker = Reranker(
+                model_name=reranker_config["model_name"],
+                device=reranker_device,
+                batch_size=retrieval_config.get("reranker_batch_size", reranker_config.get("batch_size", 64)),
+                max_length=reranker_config.get("max_length", 512),
+                use_fp16=reranker_config.get("use_fp16", False),
+            )
     
     total_questions = len(questions)
     logger.info(f"Processing {total_questions} questions with multi-threaded batch processing...")
@@ -214,16 +240,51 @@ def main():
             if not final_candidates:
                 final_candidates = candidates[:k_final]
             
-            web_ids = [int(c["doc_id"]) for c in final_candidates[:k_final]]
-            if len(web_ids) < k_final:
+            # Deduplicate by web_id: keep best chunk per document
+            web_id_to_best_chunk = {}
+            for candidate in final_candidates:
+                try:
+                    doc_id = int(candidate.get("doc_id", 0))
+                    if doc_id <= 0:
+                        continue
+                    # Keep candidate with highest score for each web_id
+                    if doc_id not in web_id_to_best_chunk:
+                        web_id_to_best_chunk[doc_id] = candidate
+                    else:
+                        current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
+                        best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
+                        if current_score > best_score:
+                            web_id_to_best_chunk[doc_id] = candidate
+                except (ValueError, TypeError):
+                    continue
+            
+            # If we still need more, fill from original candidates
+            if len(web_id_to_best_chunk) < k_final:
                 for candidate in candidates:
-                    doc_id = int(candidate["doc_id"])
-                    if doc_id not in web_ids:
-                        web_ids.append(doc_id)
-                    if len(web_ids) >= k_final:
-                        break
+                    try:
+                        doc_id = int(candidate.get("doc_id", 0))
+                        if doc_id <= 0 or doc_id in web_id_to_best_chunk:
+                            continue
+                        web_id_to_best_chunk[doc_id] = candidate
+                        if len(web_id_to_best_chunk) >= k_final:
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            
+            # Sort by score and take top-k
+            deduped_candidates = sorted(
+                web_id_to_best_chunk.values(),
+                key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
+                reverse=True
+            )[:k_final]
+            
+            web_ids = [int(c["doc_id"]) for c in deduped_candidates]
+            # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
             while len(web_ids) < k_final:
-                web_ids.append(web_ids[-1] if web_ids else 1)
+                if web_ids:
+                    web_ids.append(web_ids[-1])  # Duplicate last
+                else:
+                    web_ids.append(1)  # Fallback
             web_ids = web_ids[:k_final]
             batch_results[q_id] = web_ids
         
