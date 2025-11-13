@@ -110,17 +110,13 @@ def _parse_cuda_device(requested: str) -> Optional[int]:
     return None
 
 
-def resolve_device(preferred: Optional[str] = None, fallback: str = "cpu") -> str:
-    """
-    Resolve the best available device given a user preference.
-
-    - "auto": pick CUDA if available, else CPU.
-    - "cuda" or "cuda:{id}": verify CUDA availability, otherwise fall back.
-    - "cpu": always CPU.
-    """
+def resolve_device(preferred: Optional[str] = None, fallback: str = "cuda") -> str:  # noqa: ARG002
+    """Resolve a CUDA device preference. CPU execution is not supported."""
     pref = (preferred or "auto").lower()
     if pref in {"cpu", "cpu:0"}:
-        return "cpu"
+        raise GPUMisconfigurationError(
+            "CPU execution is disabled for this project. A compatible CUDA device is required."
+        )
 
     if torch is None:
         raise GPUMisconfigurationError("PyTorch is not available; cannot resolve a CUDA device.")
@@ -142,7 +138,9 @@ def resolve_device(preferred: Optional[str] = None, fallback: str = "cpu") -> st
         ensure_cuda_device(idx)
         return f"cuda:{idx}"
 
-    return fallback
+    raise GPUMisconfigurationError(
+        f"Unsupported device preference '{preferred}'. Use 'auto' or 'cuda[:id]'."
+    )
 
 
 def supports_fp16(device: str) -> bool:

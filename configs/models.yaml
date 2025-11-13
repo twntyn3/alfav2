@@ -5,8 +5,8 @@ embeddings:
   # alternatives: 
   # - "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
   # - "intfloat/multilingual-e5-large"
-  device: "auto"          # "auto" selects CUDA if available
-  batch_size: 64          # larger batch for GPU
+  device: "auto"          # must resolve to CUDA; raises if kernels absent
+  batch_size: 128         # optimized batch size for GPU throughput
   normalize_embeddings: true
   use_fp16: true          # enable half precision on GPU
 
@@ -16,7 +16,7 @@ reranker:
   # - "cross-encoder/ms-marco-MiniLM-L-6-v2" (faster, less accurate)
   # - "BAAI/bge-reranker-base" (multilingual)
   device: "auto"
-  batch_size: 32
+  batch_size: 64          # optimized batch size for GPU
   use_fp16: true
 
 tokenizer:
@@ -29,7 +29,7 @@ faiss:
   index_type: "Flat"  # "Flat", "IVFFlat", "IVFPQ"
   # for large datasets, consider IVFFlat or IVFPQ
   nprobe: 10  # for IVF indices
-  use_gpu: true
+  use_gpu: true           # FAISS index is cloned to GPU
   gpu_device: 0
   use_float16: true
 

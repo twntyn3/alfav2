@@ -5,6 +5,8 @@ import yaml
 import random
 import datetime
 
+from flashrag.utils import get_device, GPUMisconfigurationError
+
 
 class Config:
     def __init__(self, config_file_path=None, config_dict={}):
@@ -105,18 +107,18 @@ class Config:
         if gpu_id is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         try:
-            # import pynvml 
-            # pynvml.nvmlInit()
-            # gpu_num = pynvml.nvmlDeviceGetCount()
-            import torch
-            gpu_num = torch.cuda.device_count()
-        except:
-            gpu_num = 0
-        self.final_config['gpu_num'] = gpu_num
-        if gpu_num > 0:
-            self.final_config["device"] = "cuda"
-        else:
-            self.final_config['device'] = 'cpu'
+            device = get_device()
+        except GPUMisconfigurationError as exc:
+            raise GPUMisconfigurationError(
+                f"FlashRAG requires an operational CUDA device but none was detected: {exc}"
+            ) from exc
+        self.final_config["device"] = device
+        try:
+            import torch  # type: ignore
+            gpu_count = torch.cuda.device_count()
+        except Exception:
+            gpu_count = 0
+        self.final_config["gpu_num"] = gpu_count
 
     def _set_additional_key(self):
         def set_pooling_method(method, model2pooling):

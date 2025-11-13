@@ -229,6 +229,8 @@ class BM25Retriever(BaseTextRetriever):
     def __init__(self, config, corpus=None):
         super().__init__(config)
         self.load_model_corpus(corpus)
+        self._source_name = config.get("name", self.retrieval_method)
+        self.source_name = self._source_name
 
     def update_additional_setting(self):
         self.backend = self._config["bm25_backend"]
@@ -311,11 +313,13 @@ class BM25Retriever(BaseTextRetriever):
         elif self.backend == "bm25s":
             import bm25s
 
-            # query_tokens = self.tokenizer.tokenize([query], return_as="tuple", update_vocab=False)
             query_tokens = bm25s.tokenize([query])
             results, scores = self.searcher.retrieve(query_tokens, k=num)
-            results = list(results[0])
-            scores = list(scores[0])
+            raw_idxs = list(results[0])
+            raw_scores = [float(s) for s in list(scores[0])]
+            docs = self._materialize_results(raw_idxs, raw_scores)
+            results = docs
+            scores = raw_scores
         else:
             assert False, "Invalid bm25 backend!"
 
@@ -336,17 +340,58 @@ class BM25Retriever(BaseTextRetriever):
         elif self.backend == "bm25s":
             import bm25s
 
-            # query_tokens = self.tokenizer.tokenize(query, return_as="tuple", update_vocab=False)
             query_tokens = bm25s.tokenize(query)
-            results, scores = self.searcher.retrieve(query_tokens, k=num)
+            raw_results, raw_scores = self.searcher.retrieve(query_tokens, k=num)
+            normalized_results = []
+            normalized_scores = []
+            for doc_indices, doc_scores in zip(raw_results, raw_scores):
+                idxs = list(doc_indices)
+                scores = [float(s) for s in list(doc_scores)]
+                docs = self._materialize_results(idxs, scores)
+                normalized_results.append(docs)
+                normalized_scores.append(scores)
+            results, scores = normalized_results, normalized_scores
         else:
             assert False, "Invalid bm25 backend!"
-        results = results.tolist() if isinstance(results, np.ndarray) else results
-        scores = scores.tolist() if isinstance(scores, np.ndarray) else scores
         if return_score:
             return results, scores
         else:
             return results
+
+    def _materialize_results(self, indices, scores):
+        docs = []
+        for idx, score in zip(indices, scores):
+            try:
+                example = self.corpus[int(idx)]
+            except Exception:
+                continue
+            doc = self._normalize_example(example, default_id=idx)
+            doc["score"] = float(score)
+            doc["bm25_score"] = float(score)
+            docs.append(doc)
+        return docs
+
+    @staticmethod
+    def _normalize_example(example, default_id):
+        if isinstance(example, dict):
+            doc = dict(example)
+        else:
+            try:
+                keys = example.keys()
+                doc = {k: example[k] for k in keys}
+            except Exception:
+                doc = {"id": str(default_id), "contents": "", "doc_id": str(default_id)}
+        chunk_id = str(doc.get("id", doc.get("chunk_id", default_id)))
+        doc_id = doc.get("doc_id")
+        if doc_id is None:
+            doc_id = chunk_id.split("_")[0] if isinstance(chunk_id, str) and "_" in chunk_id else chunk_id
+        contents = doc.get("contents") or doc.get("text") or ""
+        normalized = dict(doc)
+        normalized["id"] = chunk_id
+        normalized["chunk_id"] = chunk_id
+        normalized["doc_id"] = str(doc_id)
+        normalized["contents"] = contents
+        return normalized
 
 
 class DenseRetriever(BaseTextRetriever):
@@ -358,6 +403,8 @@ class DenseRetriever(BaseTextRetriever):
         self.load_corpus(corpus)
         self.load_index()
         self.load_model()
+        self._source_name = config.get("name", self.retrieval_method)
+        self.source_name = self._source_name
 
     def load_corpus(self, corpus):
         if corpus is None:
@@ -499,6 +546,8 @@ class MultiModalRetriever(BaseRetriever):
         self.encoder = ClipEncoder(
             model_name=self.retrieval_method, model_path=config["retrieval_model_path"], silent=self.silent
         )
+        self._source_name = config.get("name", self.retrieval_method)
+        self.source_name = self._source_name
 
     def _judge_input_modal(self, query):
         if not isinstance(query, str):
@@ -588,6 +637,8 @@ class MultiRetrieverRouter:
         self.final_topk = config["multi_retriever_setting"].get("topk", 5)
         self.retriever_list = self.load_all_retriever(config)
         self.config = config
+        self.weights = config["multi_retriever_setting"].get("weights", {})
+        self._prepare_weights()
 
         if self.merge_method == "rerank":
             config["multi_retriever_setting"]["rerank_topk"] = self.final_topk
@@ -640,23 +691,74 @@ class MultiRetrieverRouter:
 
         return retriever_list
 
+    def _prepare_weights(self):
+        if self.merge_method != "weighted":
+            self.weights = {}
+            return
+        if not self.weights:
+            self.weights = {
+                getattr(retriever, "source_name", retriever.retrieval_method): 1.0 for retriever in self.retriever_list
+            }
+        normalized_weights = {}
+        for retriever in self.retriever_list:
+            name = getattr(retriever, "source_name", retriever.retrieval_method)
+            weight = float(self.weights.get(name, self.weights.get(retriever.retrieval_method, 0.0)))
+            normalized_weights[name] = max(weight, 0.0)
+        total = sum(normalized_weights.values())
+        if total <= 0:
+            raise ValueError("Weighted merge requires at least one retriever weight greater than zero.")
+        self.weights = {name: value / total if value > 0 else 0.0 for name, value in normalized_weights.items()}
+
     def add_source(self, result: Union[list, tuple], retriever):
-        retrieval_method = retriever.retrieval_method
-        corpus_path = retriever.corpus_path
+        source_name = getattr(retriever, "source_name", getattr(retriever, "_source_name", retriever.retrieval_method))
+        corpus_path = getattr(retriever, "corpus_path", None)
         is_multimodal = isinstance(retriever, MultiModalRetriever)
-        # for naive search, result is a list of dict, each repr a doc
-        # for batch search, result is a list of list, each repr a doc list(per query)
-        for item in result:
-            if isinstance(item, list):
-                for _item in item:
-                    _item["source"] = retrieval_method
-                    _item["corpus_path"] = corpus_path
-                    _item["is_multimodal"] = is_multimodal
+
+        def _normalize(doc):
+            if isinstance(doc, dict):
+                normalized = dict(doc)
             else:
-                item["source"] = retrieval_method
-                item["corpus_path"] = corpus_path
-                item["is_multimodal"] = is_multimodal
-        return result
+                try:
+                    keys = doc.keys()
+                    normalized = {k: doc[k] for k in keys}
+                except Exception:
+                    normalized = {"id": str(doc)}
+            chunk_id = str(
+                normalized.get(
+                    "chunk_id",
+                    normalized.get("id", normalized.get("doc_id", normalized.get("document_id", ""))),
+                )
+            )
+            if not chunk_id or chunk_id == "None":
+                chunk_id = str(normalized.get("doc_id", ""))
+            if not chunk_id:
+                chunk_id = source_name
+            doc_id = normalized.get("doc_id")
+            if doc_id is None:
+                doc_id = chunk_id.split("_")[0] if isinstance(chunk_id, str) and "_" in chunk_id else chunk_id
+            contents = normalized.get("contents") or normalized.get("text") or ""
+            normalized.update(
+                {
+                    "id": chunk_id,
+                    "chunk_id": chunk_id,
+                    "doc_id": str(doc_id),
+                    "contents": contents,
+                }
+            )
+            normalized["source"] = source_name
+            normalized["corpus_path"] = corpus_path
+            normalized["is_multimodal"] = is_multimodal
+            return normalized
+
+        if isinstance(result, (list, tuple)):
+            normalized_result = []
+            for item in result:
+                if isinstance(item, (list, tuple)):
+                    normalized_result.append([_normalize(_item) for _item in item])
+                else:
+                    normalized_result.append(_normalize(item))
+            return normalized_result
+        return [_normalize(result)]
 
     def _search_or_batch_search(self, query: Union[str, list], target_modal, num, return_score, method, retriever_list):
         if num is None:
@@ -769,6 +871,17 @@ class MultiRetrieverRouter:
             else:
                 result_list, score_list = self.rrf_merge(result_list, num, k=60)
             return result_list, score_list
+        elif self.merge_method == "weighted":
+            if isinstance(result_list[0], dict):
+                fused_docs, fused_scores = self._weighted_merge(result_list, score_list, num)
+                return fused_docs, fused_scores
+            fused_results = []
+            fused_scores = []
+            for docs, scores in zip(result_list, score_list):
+                merged_docs, merged_scores = self._weighted_merge(docs, scores, num)
+                fused_results.append(merged_docs)
+                fused_scores.append(merged_scores)
+            return fused_results, fused_scores
         elif self.merge_method == "rerank":
             if isinstance(result_list[0], dict):
                 query, result_list, score_list = [query], [result_list], [score_list]
@@ -831,6 +944,97 @@ class MultiRetrieverRouter:
             fused_scores.append(top_scores)
 
         return fused_results, fused_scores
+
+    def _weighted_merge(self, docs, scores, topk):
+        if not isinstance(docs, list):
+            return [], []
+        if not scores or len(scores) != len(docs):
+            scores = [float(doc.get("score", 0.0)) for doc in docs]
+        per_source_values = {}
+        doc_entries = []
+        for doc, raw_score in zip(docs, scores):
+            source = doc.get("source")
+            if source not in self.weights or self.weights[source] <= 0:
+                continue
+            raw_score = float(raw_score)
+            chunk_id = str(
+                doc.get(
+                    "chunk_id",
+                    doc.get("id", doc.get("doc_id", f"{source}-{len(doc_entries)}")),
+                )
+            )
+            doc_id = doc.get("doc_id")
+            if doc_id is None:
+                doc_id = chunk_id.split("_")[0] if "_" in chunk_id else chunk_id
+            contents = doc.get("contents") or doc.get("text") or ""
+            normalized_doc = dict(doc)
+            normalized_doc["chunk_id"] = chunk_id
+            normalized_doc["id"] = chunk_id
+            normalized_doc["doc_id"] = str(doc_id)
+            normalized_doc["contents"] = contents
+            normalized_doc.pop("source", None)
+            doc_entries.append((chunk_id, source, raw_score, normalized_doc))
+            per_source_values.setdefault(source, []).append(raw_score)
+
+        if not doc_entries:
+            fallback_docs = [dict(doc) for doc in docs[:topk]]
+            fallback_scores = [float(score) for score in scores[:topk]]
+            return fallback_docs, fallback_scores
+
+        source_stats = {}
+        for source, values in per_source_values.items():
+            arr = np.asarray(values, dtype=float)
+            if arr.size == 0:
+                continue
+            source_stats[source] = (float(arr.min()), float(arr.max()))
+
+        fused_map = {}
+        for chunk_id, source, raw_score, doc in doc_entries:
+            weight = self.weights.get(source, 0.0)
+            if weight <= 0:
+                continue
+            min_val, max_val = source_stats.get(source, (0.0, 0.0))
+            if max_val == min_val:
+                normalized = 1.0
+            else:
+                normalized = (raw_score - min_val) / (max_val - min_val)
+            entry = fused_map.setdefault(
+                chunk_id,
+                {
+                    "doc": doc,
+                    "scores": {},
+                    "fused_score": 0.0,
+                    "sources": set(),
+                },
+            )
+            entry["scores"][source] = float(raw_score)
+            entry["fused_score"] += weight * normalized
+            entry["sources"].add(source)
+            if entry["doc"].get("contents", "") == "" and doc.get("contents"):
+                entry["doc"]["contents"] = doc.get("contents")
+            entry["doc"]["chunk_id"] = doc["chunk_id"]
+            entry["doc"]["doc_id"] = doc["doc_id"]
+
+        if not fused_map:
+            fallback_docs = [dict(doc) for doc in docs[:topk]]
+            fallback_scores = [float(score) for score in scores[:topk]]
+            return fallback_docs, fallback_scores
+
+        fused_items = sorted(fused_map.values(), key=lambda item: item["fused_score"], reverse=True)
+        fused_docs = []
+        fused_scores = []
+        for entry in fused_items[:topk]:
+            doc = dict(entry["doc"])
+            fused_score = float(entry["fused_score"])
+            doc["score"] = fused_score
+            doc["hybrid_score"] = fused_score
+            doc["source_scores"] = {src: float(val) for src, val in entry["scores"].items()}
+            for src, val in entry["scores"].items():
+                doc[f"{src}_score"] = float(val)
+            doc["sources"] = sorted(entry["sources"])
+            fused_docs.append(doc)
+            fused_scores.append(fused_score)
+        return fused_docs, fused_scores
 
     def search(self, query, target_modal="text", num: Union[list, int, None] = None, return_score=False):
         # query: str or PIL.Image

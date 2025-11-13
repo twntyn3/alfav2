@@ -10,7 +10,9 @@ import csv
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 # add project root to path
 project_root = Path(__file__).parent.parent
@@ -18,9 +20,40 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "FlashRAG"))
 
 import yaml
+from src.batch_processor import BatchProcessor, optimize_batch_size
 from src.retriever import HybridRetriever
 from src.reranker import Reranker
 from src.utils import logger, get_timestamp, resolve_device
+def validate_against_sample(results: Dict[int, List[int]], sample_path: Path, k_final: int) -> None:
+    """Ensure submission matches the sample format (q_ids set and list length)."""
+    if not sample_path.exists():
+        logger.warning("Sample submission not found at %s; skipping shape validation", sample_path)
+        return
+
+    with sample_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        sample_qids = []
+        for row in reader:
+            try:
+                sample_qids.append(int(row["q_id"]))
+            except (ValueError, KeyError):
+                raise ValueError(f"Malformed row in sample submission: {row}") from None
+
+    sample_set = set(sample_qids)
+    result_set = set(results.keys())
+    if sample_set != result_set:
+        missing = sample_set - result_set
+        extra = result_set - sample_set
+        raise ValueError(
+            f"Submission q_id set mismatch with sample (missing={sorted(missing)[:5]}, extra={sorted(extra)[:5]})"
+        )
+
+    for q_id, web_ids in results.items():
+        if len(web_ids) != k_final:
+            raise ValueError(
+                f"Question {q_id} has {len(web_ids)} web ids, expected {k_final}. "
+                "Ensure candidates are padded/truncated properly."
+            )
 
 
 def load_config(config_path: str) -> dict:
@@ -119,16 +152,20 @@ def main():
         )
     
     total_questions = len(questions)
-    logger.info(f"Processing {total_questions} questions...")
+    logger.info(f"Processing {total_questions} questions with multi-threaded batch processing...")
     results = {}
     
-    retrieval_batch_size = max(1, retrieval_config.get("batch_size", 32))
+    base_batch_size = max(1, retrieval_config.get("batch_size", 64))
+    num_workers = max(1, retrieval_config.get("num_workers", 4))
     k_rerank = retrieval_config.get("k_rerank", min(k_retrieve, 20))
+    
+    retrieval_batch_size = optimize_batch_size(base_batch_size, total_questions)
+    logger.info(f"Optimized batch size: {retrieval_batch_size}, workers: {num_workers}")
     
     progress_bar = None
     try:
         from tqdm import tqdm
-        progress_bar = tqdm(total=total_questions, desc="Processing", unit="q", mininterval=10.0)
+        progress_bar = tqdm(total=total_questions, desc="Processing", unit="q", mininterval=5.0)
     except ImportError:
         logger.warning("tqdm not available, progress bar disabled")
     
@@ -136,10 +173,12 @@ def main():
     last_log_time = start_time
     processed = 0
     
-    for batch_start in range(0, total_questions, retrieval_batch_size):
-        batch = questions[batch_start:batch_start + retrieval_batch_size]
+    def process_batch(batch_data: Tuple[int, List[Tuple[int, str]]]) -> Dict[int, List[int]]:
+        """Process a single batch and return results."""
+        batch_start, batch = batch_data
         q_ids = [q for q, _ in batch]
         query_texts = [query for _, query in batch]
+        batch_results: Dict[int, List[int]] = {}
         
         try:
             batch_candidates = retriever.retrieve_batch(
@@ -169,11 +208,7 @@ def main():
         else:
             reranked_batch = [candidates[:k_final] for candidates in batch_candidates]
         
-        for local_idx, (q_id, query_text) in enumerate(batch):
-            if batch_start == 0 and local_idx == 0:
-                logger.info(f"Starting processing: question {q_id} - '{query_text[:50]}...'")
-                sys.stdout.flush()
-            
+        for local_idx, (q_id, _) in enumerate(batch):
             candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
             final_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
             if not final_candidates:
@@ -190,23 +225,47 @@ def main():
             while len(web_ids) < k_final:
                 web_ids.append(web_ids[-1] if web_ids else 1)
             web_ids = web_ids[:k_final]
-            results[q_id] = web_ids
-            
-            processed += 1
-            current_time = time.time()
-            if processed > 0 and (processed % 100 == 0 or (current_time - last_log_time) > 120):
-                elapsed = current_time - start_time
-                rate = processed / elapsed if elapsed > 0 else 0
-                remaining = (total_questions - processed) / rate if rate > 0 else 0
-                logger.info(
-                    f"Progress: {processed}/{total_questions} ({processed*100/total_questions:.1f}%), "
-                    f"elapsed: {elapsed/60:.1f}min, ETA: {remaining/60:.1f}min"
-                )
-                sys.stdout.flush()
-                last_log_time = current_time
+            batch_results[q_id] = web_ids
         
-        if progress_bar:
-            progress_bar.update(len(batch))
+        return batch_results
+    
+    batches = [
+        (start, questions[start:start + retrieval_batch_size])
+        for start in range(0, total_questions, retrieval_batch_size)
+    ]
+    
+    with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="submit_worker") as executor:
+        future_to_batch = {
+            executor.submit(process_batch, (batch_start, batch)): (batch_start, batch)
+            for batch_start, batch in batches
+        }
+        
+        for future in as_completed(future_to_batch):
+            batch_start, batch = future_to_batch[future]
+            try:
+                batch_results = future.result(timeout=600.0)
+                results.update(batch_results)
+                processed += len(batch)
+                
+                current_time = time.time()
+                if processed > 0 and (processed % 100 == 0 or (current_time - last_log_time) > 60):
+                    elapsed = current_time - start_time
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    remaining = (total_questions - processed) / rate if rate > 0 else 0
+                    logger.info(
+                        f"Progress: {processed}/{total_questions} ({processed*100/total_questions:.1f}%), "
+                        f"elapsed: {elapsed/60:.1f}min, rate: {rate:.2f} q/s, ETA: {remaining/60:.1f}min"
+                    )
+                    sys.stdout.flush()
+                    last_log_time = current_time
+                
+                if progress_bar:
+                    progress_bar.update(len(batch))
+            except Exception as exc:
+                logger.error(f"Batch {batch_start} failed: {exc}")
+                processed += len(batch)
+                if progress_bar:
+                    progress_bar.update(len(batch))
     
     if progress_bar:
         progress_bar.close()
@@ -217,11 +276,12 @@ def main():
         f"({elapsed_time:.1f}s total, {elapsed_time/max(1, total_questions):.2f}s per question)"
     )
     
-    # generate submit.csv
     timestamp = get_timestamp()
     output_path = Path(args.output) if args.output else Path(submits_dir) / f"submit_{timestamp}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    validate_against_sample(results, project_root / "sample_submission.csv", k_final)
+
     logger.info(f"Writing submit.csv to {output_path}")
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

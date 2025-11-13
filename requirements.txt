@@ -1,4 +1,4 @@
-# Core runtime
+# Core runtime (GPU execution only)
 numpy>=1.24.0,<2.0.0
 PyYAML>=6.0
 tqdm>=4.65.0
@@ -16,11 +16,11 @@ sentence-transformers>=2.2.0
 safetensors>=0.4.3
 Pillow>=9.4.0
 
-# PyTorch stack (install GPU-enabled build manually if needed)
-torch>=2.0.0
+# PyTorch stack (install CUDA build)
+torch>=2.1.0
+faiss-gpu>=1.8.0
 
 # Retrieval & indexing
-faiss-gpu>=1.8.0
 bm25s[core]==0.2.1
 
 # Datasets & preprocessing

@@ -24,7 +24,9 @@ retrieval:
   fusion_method: "weighted"  # "weighted" or "rrf" (Reciprocal Rank Fusion)
   use_reranker: true  # enable/disable reranking
   enhance_numerics: true  # enhance queries for numeric value matching
-  batch_size: 32  # number of questions processed per retrieval batch
+  batch_size: 64  # number of questions processed per retrieval batch (optimized for GPU)
+  num_workers: 4  # number of parallel threads for batch processing
+  prefetch_batches: 2  # number of batches to prefetch ahead
 
 chunking:
   size_tokens: 600

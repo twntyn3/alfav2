@@ -10,7 +10,9 @@ import copy
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 # add project root to path
 project_root = Path(__file__).parent.parent
@@ -18,11 +20,12 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "FlashRAG"))
 
 import yaml
-from src.retriever import HybridRetriever
-from src.reranker import Reranker
+from src.batch_processor import optimize_batch_size
 from src.evaluator import RetrievalEvaluator
 from src.failure_logger import FailureLogger
-from src.utils import logger, get_timestamp, resolve_device
+from src.reranker import Reranker
+from src.retriever import HybridRetriever
+from src.utils import get_timestamp, logger, resolve_device
 
 
 def load_config(config_path: str) -> dict:
@@ -143,27 +146,33 @@ def main():
     processed = 0
     first_question_logged = False
     
-    retrieval_batch_size = max(1, retrieval_config.get("batch_size", 32))
+    base_batch_size = max(1, retrieval_config.get("batch_size", 64))
+    num_workers = max(1, retrieval_config.get("num_workers", 4))
+    retrieval_batch_size = optimize_batch_size(base_batch_size, total_questions)
+    logger.info(f"Optimized batch size: {retrieval_batch_size}, workers: {num_workers}")
+    
     # progress bar configured not to interfere with logging
     progress_bar = None
     try:
         from tqdm import tqdm
-        progress_bar = tqdm(total=total_questions, desc="Processing", unit="q", file=sys.stderr, mininterval=10.0)
+        progress_bar = tqdm(total=total_questions, desc="Processing", unit="q", file=sys.stderr, mininterval=5.0)
     except ImportError:
         logger.warning("tqdm not available, progress bar disabled")
     
-    logger.info("Starting question processing loop...")
+    logger.info("Starting multi-threaded question processing loop...")
     sys.stdout.flush()
     
-    for batch_start in range(0, total_questions, retrieval_batch_size):
-        batch = questions[batch_start:batch_start + retrieval_batch_size]
+    def process_batch(batch_data: Tuple[int, List[Tuple[int, str]]]) -> Tuple[Dict[int, List[int]], List[Dict], int]:
+        """Process a single batch and return results, logs, and count."""
+        batch_start, batch = batch_data
         q_ids = [q for q, _ in batch]
         query_texts = [query for _, query in batch]
+        batch_results: Dict[int, List[int]] = {}
+        batch_logs: List[Dict] = []
         
         batch_candidates = [[] for _ in batch]
         batch_scores = [{} for _ in batch]
         
-        retrieve_start = time.time()
         try:
             batch_candidates, batch_scores = retriever.retrieve_batch(
                 query_texts,
@@ -174,20 +183,15 @@ def main():
             logger.error(f"Batch retrieval failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
             batch_candidates = [[] for _ in batch]
             batch_scores = [{} for _ in batch]
-        batch_retrieve_time = time.time() - retrieve_start
-        avg_retrieve_time = batch_retrieve_time / max(1, len(batch))
         
         original_candidates = [copy.deepcopy(cands) for cands in batch_candidates]
-        
         reranked_batch = [cands[:k_final] for cands in batch_candidates]
-        batch_rerank_time = 0.0
         
         if reranker:
             rerank_inputs = [
                 [dict(candidate) for candidate in candidates[:k_rerank]]
                 for candidates in batch_candidates
             ]
-            rerank_start = time.time()
             try:
                 reranked_batch = reranker.batch_rerank(
                     query_texts,
@@ -198,63 +202,13 @@ def main():
             except Exception as e:
                 logger.error(f"Batch reranking failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
                 reranked_batch = rerank_inputs
-            batch_rerank_time = time.time() - rerank_start
-        avg_rerank_time = batch_rerank_time / max(1, len(batch))
         
         for local_idx, (q_id, query_text) in enumerate(batch):
-            global_idx = batch_start + local_idx
             candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
             scores = batch_scores[local_idx] if local_idx < len(batch_scores) else {}
             candidates_before_rerank_list = original_candidates[local_idx] if local_idx < len(original_candidates) else []
             reranked_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
             
-            if not first_question_logged:
-                logger.info(f"✓ Starting processing: question {q_id} - '{query_text[:50]}...'")
-                sys.stdout.flush()
-                first_question_logged = True
-            elif global_idx % 100 == 0:
-                logger.info(f"✓ Processed {global_idx} questions so far...")
-                sys.stdout.flush()
-            
-            if global_idx < 5:
-                logger.info(f"  [Q{q_id}] Retrieval done in {avg_retrieve_time:.2f}s (batch avg)")
-                if reranker and reranked_candidates:
-                    logger.info(f"  [Q{q_id}] Reranking done in {avg_rerank_time:.2f}s (batch avg)")
-                sys.stdout.flush()
-            elif global_idx % 100 == 0:
-                logger.info(f"  [Q{q_id}] Retrieval batch avg {avg_retrieve_time:.2f}s")
-                if reranker and reranked_candidates:
-                    logger.info(f"  [Q{q_id}] Rerank batch avg {avg_rerank_time:.2f}s")
-                sys.stdout.flush()
-            
-            # log progress every 10 questions (first 50), then every 50, or every minute
-            processed += 1
-            current_time = time.time()
-            should_log = False
-            if processed == 1:
-                should_log = True
-            elif processed < 50 and processed % 10 == 0:
-                should_log = True
-            elif processed % 50 == 0:
-                should_log = True
-            elif (current_time - last_log_time) > 60:
-                should_log = True
-            
-            if should_log:
-                elapsed = current_time - start_time
-                rate = processed / elapsed if elapsed > 0 else 0
-                remaining = (total_questions - processed) / rate if rate > 0 else 0
-                logger.info(
-                    f"Progress: {processed}/{total_questions} questions "
-                    f"({processed*100/total_questions:.1f}%), "
-                    f"elapsed: {elapsed/60:.1f}min, "
-                    f"rate: {rate:.2f} q/s, "
-                    f"ETA: {remaining/60:.1f}min"
-                )
-                sys.stdout.flush()
-                last_log_time = current_time
-            
-            # log candidates before reranking
             log_entry_before = {
                 "q_id": q_id,
                 "query": query_text,
@@ -270,7 +224,7 @@ def main():
                     for c in candidates[:k_retrieve]
                 ]
             }
-            candidate_logs.append(log_entry_before)
+            batch_logs.append(log_entry_before)
             
             candidates_after_rerank = reranked_candidates if reranker else None
             
@@ -288,19 +242,17 @@ def main():
                         for c in reranked_candidates[:k_final]
                     ]
                 }
-                candidate_logs.append(log_entry_after)
+                batch_logs.append(log_entry_after)
             
-            # extract web_ids (doc_ids)
             final_candidates = reranked_candidates if reranker else candidates[:k_final]
             web_ids = [int(c["doc_id"]) for c in final_candidates[:k_final]]
             if len(web_ids) < k_final and candidates:
-                # pad with available candidates
                 additional = [int(c["doc_id"]) for c in candidates[k_final:]]
                 web_ids.extend(additional[: k_final - len(web_ids)])
             while len(web_ids) < k_final:
                 web_ids.append(web_ids[-1] if web_ids else 1)
             web_ids = web_ids[:k_final]
-            results[q_id] = web_ids
+            batch_results[q_id] = web_ids
             
             failure_logger.log_retrieval_failure(
                 q_id=q_id,
@@ -311,8 +263,59 @@ def main():
                 k=k_final
             )
         
-        if progress_bar:
-            progress_bar.update(len(batch))
+        return batch_results, batch_logs, len(batch)
+    
+    batches = [
+        (start, questions[start:start + retrieval_batch_size])
+        for start in range(0, total_questions, retrieval_batch_size)
+    ]
+    
+    with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="eval_worker") as executor:
+        future_to_batch = {
+            executor.submit(process_batch, (batch_start, batch)): (batch_start, batch)
+            for batch_start, batch in batches
+        }
+        
+        for future in as_completed(future_to_batch):
+            batch_start, batch = future_to_batch[future]
+            try:
+                batch_results, batch_logs, batch_size = future.result(timeout=600.0)
+                results.update(batch_results)
+                candidate_logs.extend(batch_logs)
+                processed += batch_size
+                
+                current_time = time.time()
+                should_log = False
+                if processed == 1:
+                    should_log = True
+                elif processed < 50 and processed % 10 == 0:
+                    should_log = True
+                elif processed % 50 == 0:
+                    should_log = True
+                elif (current_time - last_log_time) > 60:
+                    should_log = True
+                
+                if should_log:
+                    elapsed = current_time - start_time
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    remaining = (total_questions - processed) / rate if rate > 0 else 0
+                    logger.info(
+                        f"Progress: {processed}/{total_questions} questions "
+                        f"({processed*100/total_questions:.1f}%), "
+                        f"elapsed: {elapsed/60:.1f}min, "
+                        f"rate: {rate:.2f} q/s, "
+                        f"ETA: {remaining/60:.1f}min"
+                    )
+                    sys.stdout.flush()
+                    last_log_time = current_time
+                
+                if progress_bar:
+                    progress_bar.update(batch_size)
+            except Exception as exc:
+                logger.error(f"Batch {batch_start} failed: {exc}")
+                processed += len(batch)
+                if progress_bar:
+                    progress_bar.update(len(batch))
     
     if progress_bar:
         progress_bar.close()

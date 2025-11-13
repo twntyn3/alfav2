@@ -142,7 +142,7 @@ class SuRePipeline(BasicPipeline):
         """Parse candidates from model response"""
         model_response = model_response.strip("\n").strip()
         # r'\([a-z]\) ([^,]+)'
-        candidates = re.findall("\((\w+)\)\s*([^()]+)", model_response)
+        candidates = re.findall(r"\((\w+)\)\s*([^()]+)", model_response)
         candidates = [cand[1].split("\n")[0].strip() for cand in candidates]
         # post-process
         candidates = [cand.replace(",", "").strip() for cand in candidates]
