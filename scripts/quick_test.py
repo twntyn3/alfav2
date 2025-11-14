@@ -145,8 +145,15 @@ def test_retrieval(retriever: HybridRetriever):
         logger.info(f"✓ Retrieval successful ({elapsed:.2f}s)")
         for i, (query, candidates) in enumerate(zip(test_queries, results)):
             logger.info(f"  Query {i+1}: '{query}' -> {len(candidates)} candidates")
-            if candidates:
-                logger.info(f"    Top candidate: {candidates[0].get('doc_id', 'N/A')} (score: {candidates[0].get('score', 0):.4f})")
+            if candidates and len(candidates) > 0 and isinstance(candidates[0], dict):
+                top_candidate = candidates[0]
+                doc_id = top_candidate.get('doc_id', 'N/A')
+                score = top_candidate.get('score', 0.0)
+                try:
+                    score = float(score) if score is not None else 0.0
+                except (ValueError, TypeError):
+                    score = 0.0
+                logger.info(f"    Top candidate: {doc_id} (score: {score:.4f})")
         return True
     except Exception as e:
         logger.error(f"✗ Retrieval failed: {e}")

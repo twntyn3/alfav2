@@ -129,14 +129,16 @@ class HybridRetriever:
         method = fusion_method or self.fusion_method
         prepared_queries = self._prepare_queries(queries)
 
-        self.router.final_topk = topk
+        # Request more candidates than needed for better quality (20% more)
+        retrieval_topk = int(topk * 1.2)
+        self.router.final_topk = retrieval_topk
         self.router.merge_method = method
-        self._update_retriever_topk(topk)
+        self._update_retriever_topk(retrieval_topk)
 
         if method == "weighted":
             self.router.weights = self._normalized_weights()
 
-        results, score_lists = self.router.batch_search(prepared_queries, num=topk, return_score=True)
+        results, score_lists = self.router.batch_search(prepared_queries, num=retrieval_topk, return_score=True)
 
         processed_results: List[List[Dict[str, Any]]] = []
         processed_scores: List[Dict[str, Dict[str, float]]] = []
@@ -152,24 +154,77 @@ class HybridRetriever:
             original_query = queries[idx] if idx < len(queries) else ""
             is_numeric_query = self._is_numeric_query(original_query)
             
-            for doc_idx, doc in enumerate(docs[:topk]):
+            # Normalize scores for better ranking
+            all_scores = []
+            for doc_idx in range(min(len(docs), retrieval_topk)):
+                if doc_idx < len(raw_scores) and raw_scores[doc_idx] is not None:
+                    all_scores.append(float(raw_scores[doc_idx]))
+            
+            if all_scores:
+                max_score = max(all_scores)
+                min_score = min(all_scores)
+                score_range = max_score - min_score if max_score > min_score else 1.0
+            else:
+                max_score = 0.0
+                min_score = 0.0
+                score_range = 1.0
+            
+            for doc_idx, doc in enumerate(docs[:retrieval_topk]):
                 fallback_score = raw_scores[doc_idx] if doc_idx < len(raw_scores) else None
                 candidate = self._to_candidate(doc, fallback_score)
                 
-                # Filter by minimum score threshold if enabled
-                if self.min_score_threshold > 0.0 and candidate["score"] < self.min_score_threshold:
+                # Normalize hybrid score for better comparison
+                if score_range > 0 and candidate.get("score") is not None:
+                    score_val = float(candidate["score"])
+                    if min_score != max_score:
+                        normalized_score = (score_val - min_score) / score_range
+                    else:
+                        normalized_score = 0.5
+                    # Clamp to [0, 1] range
+                    normalized_score = max(0.0, min(1.0, normalized_score))
+                    candidate["normalized_score"] = normalized_score
+                else:
+                    candidate["normalized_score"] = 0.0
+                
+                # Filter by minimum score threshold if enabled (safe check for score)
+                candidate_score = candidate.get("score")
+                if candidate_score is None:
+                    candidate_score = 0.0
+                else:
+                    try:
+                        candidate_score = float(candidate_score)
+                    except (ValueError, TypeError):
+                        candidate_score = 0.0
+                
+                if self.min_score_threshold > 0.0 and candidate_score < self.min_score_threshold:
                     continue
+                
+                # Update score in candidate if it was None
+                if candidate.get("score") is None:
+                    candidate["score"] = candidate_score
                 
                 # Filter/prefer by document type if enabled
                 if self.filter_by_document_type or self.prefer_table_chunks:
                     has_table = candidate.get("has_table", False) or self._detect_table_in_candidate(candidate)
                     candidate["has_table"] = has_table
                     
-                    # Prefer table chunks for numeric queries
+                    # Prefer table chunks for numeric queries - stronger boost
                     if self.prefer_table_chunks and is_numeric_query and has_table:
-                        candidate["score"] = candidate["score"] * 1.2  # Boost score by 20%
+                        candidate["score"] = candidate_score * 1.3  # Boost score by 30%
+                        candidate["normalized_score"] = min(1.0, candidate.get("normalized_score", 0.5) * 1.3)
                 
                 candidates.append(candidate)
+            
+            # Sort by combined score (hybrid + normalized) for better quality
+            candidates.sort(key=lambda c: (
+                c.get("normalized_score", c.get("score", 0.0)),
+                c.get("score", 0.0),
+                c.get("dense_score", 0.0)
+            ), reverse=True)
+            
+            # Take top-k after sorting
+            candidates = candidates[:topk]
+            
             processed_results.append(candidates)
             if return_scores:
                 processed_scores.append(
@@ -190,6 +245,7 @@ class HybridRetriever:
 
     def _prepare_queries(self, queries: List[str]) -> List[str]:
         from src.text_processor import normalize_for_retrieval
+        from src.table_processor import extract_keywords
         
         prepared = []
         for query in queries:
@@ -197,15 +253,33 @@ class HybridRetriever:
                 # Empty query - use placeholder to avoid BM25 errors
                 prepared.append(" ")
                 continue
-            # Apply numeric enhancement if enabled
+            
+            original_query = query.strip()
+            
+            # Apply keyword-based enhancement if enabled
             if self.enhance_numerics:
                 query = enhance_query_for_numerics(query)
+                
+                # Extract keywords and add subtle boost for important terms
+                keywords = extract_keywords(query)
+                important_keywords = ["реквизиты", "номер", "счет", "счёт", "карта", "баланс", "кредит", "вклад"]
+                found_important = [kw for kw in keywords if kw in important_keywords]
+                
+                # Add important keywords with slight repetition for BM25 boost (subtle, not too aggressive)
+                if found_important and query and isinstance(query, str):
+                    query_words = query.split()
+                    if len(query_words) < 30:  # Only if query not too long
+                        for kw in found_important[:2]:  # Add top 2 important keywords
+                            query_lower = query.lower()
+                            if kw not in query_lower or query_lower.count(kw) < 2:
+                                query += f" {kw}"  # Subtle boost
+            
             # Normalize query to match corpus normalization
             normalized = normalize_for_retrieval(query, mode=self.normalization_mode)
             # Ensure normalized query is not empty
             if not normalized or not normalized.strip():
                 # Fallback to original query if normalization removed everything
-                prepared.append(query.strip() if query.strip() else " ")
+                prepared.append(original_query.strip() if original_query.strip() else " ")
             else:
                 prepared.append(normalized)
         return prepared
@@ -326,8 +400,10 @@ class HybridRetriever:
             "dense_score": dense_score,
             "bm25_score": bm25_score,
             "contents": doc.get("contents") or doc.get("text") or "",
-            "source_scores": {key: float(value) for key, value in source_scores.items()},
-            "sources": doc.get("sources", []),
+            "source_scores": {key: float(val) if val is not None else 0.0 
+                            for key, val in source_scores.items() 
+                            if isinstance(val, (int, float, str))},
+            "sources": doc.get("sources", []) if isinstance(doc.get("sources"), list) else [],
             "has_table": doc.get("has_table", False),
         }
         return candidate

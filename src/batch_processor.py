@@ -56,8 +56,12 @@ class BatchProcessor:
             future = self._executor.submit(process_fn, batch)
             futures[future] = batch_idx
 
-        for future in as_completed(futures, timeout=batch_timeout * len(batches)):
-            batch_idx = futures[future]
+        # Cap timeout to reasonable maximum (10 minutes per batch is already very generous)
+        max_total_timeout = min(batch_timeout * len(batches), 600.0)  # Max 10 minutes total
+        for future in as_completed(futures, timeout=max_total_timeout):
+            batch_idx = futures.get(future)
+            if batch_idx is None:
+                continue
             try:
                 results[batch_idx] = future.result(timeout=batch_timeout)
             except Exception as exc:

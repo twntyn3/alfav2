@@ -156,7 +156,12 @@ class SemanticChunker:
         Returns:
             List of chunks with semantic structure preserved
         """
-        doc_id = str(doc["id"])
+        # Safely extract doc_id
+        doc_id = str(doc.get("id", doc.get("doc_id", "unknown")))
+        if doc_id == "unknown":
+            logger.warning("Document without id field, skipping")
+            return []
+        
         title = doc.get("title", "").strip()
         text = doc.get("text", "").strip()
         

@@ -133,9 +133,9 @@ class FailureLogger:
                     numerics_found = True
                     break
             
-            if not numerics_found:
+            if not numerics_found and query_numerics:
                 suggestions.append(
-                    f"Numeric value {query_numerics[0]['value']} not found in top candidates - "
+                    f"Numeric value {query_numerics[0].get('value', 'unknown')} not found in top candidates - "
                     "may need better numeric matching or query expansion"
                 )
         
@@ -151,11 +151,13 @@ class FailureLogger:
                 "1) Improve reranker, 2) Adjust rerank top-K, 3) Check reranker model"
             )
         
-        # Query length analysis
-        if len(query.split()) < 3:
-            suggestions.append("Short query - consider query expansion or synonym matching")
-        elif len(query.split()) > 20:
-            suggestions.append("Long query - consider query summarization or key phrase extraction")
+        # Query length analysis (safe string split)
+        if query and isinstance(query, str):
+            query_words = query.split()
+            if len(query_words) < 3:
+                suggestions.append("Short query - consider query expansion or synonym matching")
+            elif len(query_words) > 20:
+                suggestions.append("Long query - consider query summarization or key phrase extraction")
         
         return suggestions
     

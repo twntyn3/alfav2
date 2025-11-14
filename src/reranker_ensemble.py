@@ -95,9 +95,12 @@ class RerankerEnsemble:
             top_k=top_k,
             return_scores=True,
         )
+        # Safe access with validation
+        if not results or not scores:
+            return ([], []) if return_scores else []
         if return_scores:
-            return (results[0], scores[0])
-        return results[0]
+            return (results[0] if results else [], scores[0] if scores else [])
+        return results[0] if results else []
 
     def shrink_batch_size(self, factor: float = 0.5, min_batch: int = 4) -> bool:
         """
@@ -144,14 +147,49 @@ class RerankerEnsemble:
         all_scores: List[List[List[float]]] = []
         
         for reranker in self.rerankers:
-            reranked, scores = reranker.batch_rerank(
-                queries,
-                candidates_list,
-                top_k=len(candidates_list[0]) if candidates_list else top_k,
-                return_scores=True,
-            )
-            all_reranked.append(reranked)
-            all_scores.append(scores)
+            try:
+                # Determine safe top_k value
+                safe_topk = top_k
+                if candidates_list and len(candidates_list) > 0:
+                    if len(candidates_list[0]) > 0:
+                        safe_topk = min(len(candidates_list[0]), top_k * 2)  # Get more than needed for better ensemble
+                    else:
+                        safe_topk = top_k
+                else:
+                    safe_topk = top_k
+                
+                reranked, scores = reranker.batch_rerank(
+                    queries,
+                    candidates_list,
+                    top_k=safe_topk,
+                    return_scores=True,
+                )
+                
+                # Validate results
+                if not reranked or not scores:
+                    logger.warning("Reranker returned empty results")
+                    continue
+                if len(reranked) != len(queries) or len(scores) != len(queries):
+                    logger.warning(f"Reranker results length mismatch: reranked={len(reranked)}, scores={len(scores)}, queries={len(queries)}")
+                    continue
+                
+                all_reranked.append(reranked)
+                all_scores.append(scores)
+            except Exception as e:
+                logger.error(f"Error in reranker batch_rerank: {e}")
+                continue
+        
+        # Check if we have any reranked results
+        if not all_reranked or not all_scores:
+            logger.warning("No reranked results available, returning empty results")
+            # Return candidates as-is if available
+            if candidates_list and len(candidates_list) > 0:
+                fallback_results = [cands[:top_k] for cands in candidates_list]
+                fallback_scores = [[0.0] * min(len(cands), top_k) for cands in candidates_list]
+                if return_scores:
+                    return fallback_results, fallback_scores
+                return fallback_results
+            return ([], []) if return_scores else []
         
         # Combine scores using weighted average
         ensemble_results: List[List[Dict[str, Any]]] = []
@@ -164,13 +202,35 @@ class RerankerEnsemble:
             
             # Collect scores from all rerankers
             for reranker_idx, (reranked, scores) in enumerate(zip(all_reranked, all_scores)):
+                if reranker_idx >= len(self.weights):
+                    logger.warning(f"Reranker index {reranker_idx} exceeds weights length, skipping")
+                    continue
                 weight = self.weights[reranker_idx]
-                for candidate, score in zip(reranked[query_idx], scores[query_idx]):
-                    chunk_id = candidate.get("chunk_id", str(candidate.get("id", "")))
-                    if chunk_id not in candidate_scores:
-                        candidate_scores[chunk_id] = []
-                        candidate_data[chunk_id] = candidate
-                    candidate_scores[chunk_id].append(float(score) * weight)
+                
+                # Safe access to reranked and scores
+                if query_idx >= len(reranked) or query_idx >= len(scores):
+                    logger.warning(f"Query index {query_idx} out of range for reranker {reranker_idx}")
+                    continue
+                
+                query_reranked = reranked[query_idx]
+                query_scores = scores[query_idx]
+                
+                if not query_reranked or not query_scores:
+                    continue
+                
+                for candidate, score in zip(query_reranked, query_scores):
+                    try:
+                        chunk_id = candidate.get("chunk_id", str(candidate.get("id", "")))
+                        if not chunk_id:
+                            continue
+                        if chunk_id not in candidate_scores:
+                            candidate_scores[chunk_id] = []
+                            candidate_data[chunk_id] = candidate
+                        score_val = float(score) if score is not None else 0.0
+                        candidate_scores[chunk_id].append(score_val * weight)
+                    except (ValueError, TypeError, AttributeError) as e:
+                        logger.warning(f"Error processing candidate score: {e}")
+                        continue
             
             # Compute weighted average scores
             final_candidates: List[Tuple[float, Dict[str, Any]]] = []
@@ -179,27 +239,57 @@ class RerankerEnsemble:
                 candidate = candidate_data[chunk_id].copy()
                 candidate["ensemble_score"] = avg_score
                 candidate["rerank_score"] = avg_score
-                candidate["score"] = avg_score
+                # Preserve original hybrid score if better than ensemble average
+                original_score = candidate.get("score", 0.0)
+                if isinstance(original_score, (int, float)) and original_score > avg_score * 0.8:
+                    candidate["score"] = max(original_score, avg_score)
+                else:
+                    candidate["score"] = avg_score
+                # Normalize ensemble score for better comparison
+                candidate["normalized_score"] = 1.0 / (1.0 + pow(2.718, -avg_score / 2.0))
                 final_candidates.append((avg_score, candidate))
             
             # Sort by ensemble score
             final_candidates.sort(key=lambda x: x[0], reverse=True)
             
             # Second pass: rerank top candidates again if enabled
-            if self.second_pass and len(final_candidates) > self.second_pass_topk:
-                top_candidates = [cand for _, cand in final_candidates[:self.second_pass_topk]]
-                # Use first reranker for second pass
-                second_pass_reranked, second_pass_scores = self.rerankers[0].batch_rerank(
-                    [queries[query_idx]],
-                    [top_candidates],
-                    top_k=top_k,
-                    return_scores=True,
-                )
-                # Replace top candidates with second-pass results
-                final_candidates = [
-                    (score, cand)
-                    for cand, score in zip(second_pass_reranked[0], second_pass_scores[0])
-                ] + final_candidates[self.second_pass_topk:]
+            if self.second_pass and len(final_candidates) > self.second_pass_topk and self.rerankers:
+                try:
+                    top_candidates = [cand for _, cand in final_candidates[:self.second_pass_topk]]
+                    # Use first reranker for second pass
+                    if not top_candidates:
+                        logger.warning(f"No candidates for second pass on query {query_idx}")
+                    else:
+                        second_pass_reranked, second_pass_scores = self.rerankers[0].batch_rerank(
+                            [queries[query_idx]],
+                            [top_candidates],
+                            top_k=top_k,
+                            return_scores=True,
+                        )
+                        # Safe access to second pass results
+                        if second_pass_reranked and second_pass_scores and len(second_pass_reranked) > 0 and len(second_pass_scores) > 0:
+                            second_pass_results = second_pass_reranked[0]
+                            second_pass_scores_list = second_pass_scores[0]
+                            
+                            # Replace top candidates with second-pass results
+                            second_pass_with_scores = []
+                            for cand, score in zip(second_pass_results, second_pass_scores_list):
+                                try:
+                                    score_val = float(score) if score is not None else 0.0
+                                    second_pass_with_scores.append((score_val, cand))
+                                    # Update scores in second-pass candidates
+                                    cand["rerank_score"] = score_val
+                                    cand["ensemble_score"] = score_val
+                                    cand["normalized_score"] = 1.0 / (1.0 + pow(2.718, -score_val / 2.0))
+                                except (ValueError, TypeError, ZeroDivisionError):
+                                    logger.warning(f"Error processing second pass score: {score}")
+                                    continue
+                            
+                            if second_pass_with_scores:
+                                final_candidates = second_pass_with_scores + final_candidates[self.second_pass_topk:]
+                except (IndexError, AttributeError, TypeError) as e:
+                    logger.warning(f"Error in second pass reranking: {e}, using first pass results")
+                    # Continue with first pass results
             
             # Take top_k
             top_candidates = [cand for _, cand in final_candidates[:top_k]]

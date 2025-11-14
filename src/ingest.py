@@ -80,11 +80,20 @@ def read_websites_csv(csv_path: str, validate: bool = True, normalize_for_search
                         continue
                 
                 # if no title but has text, use first sentence as title
-                if not title and text:
-                    first_sentence = text.split(".", 1)[0].strip()
-                    if len(first_sentence) < 100:
-                        title = first_sentence
-                        text = text[len(first_sentence):].lstrip(". ")
+                if not title and text and isinstance(text, str):
+                    try:
+                        first_sentence = text.split(".", 1)[0].strip()
+                        if first_sentence and len(first_sentence) < 100:
+                            title = first_sentence
+                            # Safe substring extraction
+                            remaining_start = len(first_sentence)
+                            if remaining_start < len(text):
+                                text = text[remaining_start:].lstrip(". ")
+                            else:
+                                text = ""
+                    except (AttributeError, IndexError):
+                        # If split fails, skip title extraction
+                        pass
                 
                 # ensure we have content
                 if not title and not text:

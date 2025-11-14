@@ -94,9 +94,12 @@ class Reranker:
             top_k=top_k,
             return_scores=True,
         )
+        # Safe access with validation
+        if not results or not scores:
+            return ([], []) if return_scores else []
         if return_scores:
-            return (results[0], scores[0])
-        return results[0]
+            return (results[0] if results else [], scores[0] if scores else [])
+        return results[0] if results else []
 
     def batch_rerank(
         self,
@@ -162,7 +165,14 @@ class Reranker:
         candidate = dict(doc)
         candidate["chunk_id"] = chunk_id
         candidate["doc_id"] = str(doc_id)
-        candidate["rerank_score"] = float(score)
-        candidate["score"] = float(score if candidate.get("score") is None else candidate["score"])
+        rerank_score = float(score)
+        candidate["rerank_score"] = rerank_score
+        # Preserve original scores if available
+        if candidate.get("score") is None:
+            candidate["score"] = rerank_score
+        if candidate.get("normalized_score") is None:
+            # Normalize rerank score to 0-1 range (assuming cross-encoder scores are typically -10 to 10)
+            # Use sigmoid-like normalization for better comparison
+            candidate["normalized_score"] = 1.0 / (1.0 + pow(2.718, -rerank_score / 2.0))
         return candidate
 

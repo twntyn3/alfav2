@@ -143,9 +143,16 @@ class RetrievalEvaluator:
         ndcg_scores = {k: [] for k in k_values}
         
         for q_id, retrieved_web_ids in results.items():
-            # convert to int if needed
+            # Safely convert to int if needed
+            if not retrieved_web_ids:
+                # Skip empty results
+                continue
             if isinstance(retrieved_web_ids[0], str):
-                retrieved_web_ids = [int(wid) for wid in retrieved_web_ids]
+                try:
+                    retrieved_web_ids = [int(wid) for wid in retrieved_web_ids if wid]
+                except (ValueError, TypeError):
+                    # If conversion fails, skip this query
+                    continue
             
             for k in k_values:
                 hit_scores[k].append(self.hit_at_k(q_id, retrieved_web_ids, k))

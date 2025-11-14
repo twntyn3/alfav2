@@ -84,11 +84,16 @@ class DocumentChunker:
         
         # old format: contents field with title\ntext
         if "contents" in doc:
-            contents = doc["contents"]
-            lines = contents.split("\n", 1)
-            title = lines[0].strip() if lines else ""
-            text = lines[1].strip() if len(lines) > 1 else ""
-            return title, text
+            contents = doc.get("contents", "")
+            if not isinstance(contents, str):
+                contents = str(contents) if contents is not None else ""
+            try:
+                lines = contents.split("\n", 1)
+                title = lines[0].strip() if lines else ""
+                text = lines[1].strip() if len(lines) > 1 else ""
+                return title, text
+            except (AttributeError, IndexError):
+                return "", ""
         
         return "", ""
     
@@ -102,7 +107,12 @@ class DocumentChunker:
         Returns:
             List of chunks with "id", "doc_id", "title", "text", "contents" fields
         """
-        doc_id = str(doc["id"])
+        # Safely extract doc_id
+        doc_id = str(doc.get("id", doc.get("doc_id", "unknown")))
+        if doc_id == "unknown":
+            logger.warning("Document without id field, skipping")
+            return []
+        
         title, text = self._extract_title_and_text(doc)
         
         if not title and not text:

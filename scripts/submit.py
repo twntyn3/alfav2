@@ -305,49 +305,106 @@ def main():
         
         for local_idx, (q_id, _) in enumerate(batch):
             candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
-            final_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
-            if not final_candidates:
-                final_candidates = candidates[:k_final]
+            # Safe access to reranked_batch
+            if local_idx < len(reranked_batch) and reranked_batch[local_idx]:
+                final_candidates = reranked_batch[local_idx]
+            else:
+                final_candidates = candidates[:k_final] if candidates else []
             
-            # Deduplicate by web_id: keep best chunk per document
+            # Deduplicate by web_id: keep best chunk per document with improved scoring
             web_id_to_best_chunk = {}
             for candidate in final_candidates:
                 try:
                     doc_id = int(candidate.get("doc_id", 0))
                     if doc_id <= 0:
                         continue
-                    # Keep candidate with highest score for each web_id
+                    # Calculate combined score: prioritize rerank_score, then normalized_score, then hybrid score
+                    rerank_score = float(candidate.get("rerank_score", 0.0))
+                    normalized_score = float(candidate.get("normalized_score", 0.0))
+                    hybrid_score = float(candidate.get("score", 0.0))
+                    dense_score = float(candidate.get("dense_score", 0.0))
+                    
+                    # Weighted combination: rerank (if available) has highest weight
+                    if rerank_score > 0:
+                        combined_score = (rerank_score * 0.7 + normalized_score * 0.2 + hybrid_score * 0.1)
+                    elif normalized_score > 0:
+                        combined_score = (normalized_score * 0.6 + hybrid_score * 0.4)
+                    else:
+                        combined_score = (hybrid_score * 0.7 + dense_score * 0.3)
+                    
+                    # Keep candidate with highest combined score for each web_id
                     if doc_id not in web_id_to_best_chunk:
+                        candidate["combined_score"] = combined_score
                         web_id_to_best_chunk[doc_id] = candidate
                     else:
-                        current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
-                        best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
-                        if current_score > best_score:
+                        best_combined = web_id_to_best_chunk[doc_id].get("combined_score", 0.0)
+                        if combined_score > best_combined:
+                            candidate["combined_score"] = combined_score
                             web_id_to_best_chunk[doc_id] = candidate
                 except (ValueError, TypeError):
                     continue
             
-            # If we still need more, fill from original candidates
+            # If we still need more, fill from original candidates with same scoring logic
             if len(web_id_to_best_chunk) < k_final:
                 for candidate in candidates:
                     try:
                         doc_id = int(candidate.get("doc_id", 0))
                         if doc_id <= 0 or doc_id in web_id_to_best_chunk:
                             continue
+                        # Calculate combined score using same logic
+                        rerank_score = float(candidate.get("rerank_score", 0.0))
+                        normalized_score = float(candidate.get("normalized_score", 0.0))
+                        hybrid_score = float(candidate.get("score", 0.0))
+                        dense_score = float(candidate.get("dense_score", 0.0))
+                        
+                        if rerank_score > 0:
+                            combined_score = (rerank_score * 0.7 + normalized_score * 0.2 + hybrid_score * 0.1)
+                        elif normalized_score > 0:
+                            combined_score = (normalized_score * 0.6 + hybrid_score * 0.4)
+                        else:
+                            combined_score = (hybrid_score * 0.7 + dense_score * 0.3)
+                        
+                        candidate["combined_score"] = combined_score
                         web_id_to_best_chunk[doc_id] = candidate
                         if len(web_id_to_best_chunk) >= k_final:
                             break
                     except (ValueError, TypeError):
                         continue
             
-            # Sort by score and take top-k
+            # Sort by combined score (or fallback to rerank_score/score) and take top-k
             deduped_candidates = sorted(
                 web_id_to_best_chunk.values(),
-                key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
+                key=lambda c: (
+                    c.get("combined_score", 0.0),
+                    float(c.get("rerank_score", 0.0)),
+                    float(c.get("normalized_score", 0.0)),
+                    float(c.get("score", 0.0))
+                ),
                 reverse=True
             )[:k_final]
             
-            web_ids = [int(c["doc_id"]) for c in deduped_candidates]
+            # Safely extract web_ids with error handling
+            web_ids = []
+            for c in deduped_candidates:
+                try:
+                    doc_id = c.get("doc_id")
+                    if doc_id is None:
+                        continue
+                    # Try to convert to int, handle string numbers and "unknown"
+                    if isinstance(doc_id, int):
+                        web_id = doc_id
+                    elif isinstance(doc_id, str):
+                        if doc_id.lower() in ("unknown", "none", ""):
+                            continue
+                        web_id = int(doc_id)
+                    else:
+                        web_id = int(doc_id)
+                    
+                    if web_id > 0:
+                        web_ids.append(web_id)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+            
             # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
             while len(web_ids) < k_final:
                 if web_ids:

@@ -264,15 +264,43 @@ def main():
         # Diagnostic: compute recall@50 before reranking if ground truth available
         if evaluator.ground_truth and batch_start == 0:
             recall_at_50_before_rerank = 0.0
+            valid_recalls = 0
             for local_idx, (q_id, _) in enumerate(batch):
-                if q_id in evaluator.ground_truth:
-                    retrieved_web_ids = [int(c.get("doc_id", 0)) for c in batch_candidates[local_idx][:50]]
-                    recall_at_50_before_rerank += evaluator.recall_at_k(q_id, retrieved_web_ids, k=50)
-            if len(batch) > 0:
-                recall_at_50_before_rerank /= len(batch)
+                if q_id in evaluator.ground_truth and local_idx < len(batch_candidates):
+                    try:
+                        # Safely extract web_ids
+                        web_ids = []
+                        for c in batch_candidates[local_idx][:50]:
+                            try:
+                                doc_id = c.get("doc_id", 0)
+                                if doc_id is None:
+                                    continue
+                                if isinstance(doc_id, int):
+                                    web_id = doc_id
+                                elif isinstance(doc_id, str):
+                                    if doc_id.lower() in ("unknown", "none", ""):
+                                        continue
+                                    web_id = int(doc_id)
+                                else:
+                                    web_id = int(doc_id)
+                                if web_id > 0:
+                                    web_ids.append(web_id)
+                            except (ValueError, TypeError, AttributeError):
+                                continue
+                        
+                        if web_ids:
+                            recall = evaluator.recall_at_k(q_id, web_ids, k=50)
+                            recall_at_50_before_rerank += recall
+                            valid_recalls += 1
+                    except Exception as e:
+                        logger.debug(f"Error computing recall for q_id={q_id}: {e}")
+                        continue
+            
+            if valid_recalls > 0:
+                recall_at_50_before_rerank /= valid_recalls
                 logger.info(f"Diagnostic: Recall@50 before rerank (first batch): {recall_at_50_before_rerank:.4f}")
-            else:
-                logger.warning("First batch is empty, skipping diagnostic recall@50")
+            elif len(batch) > 0:
+                logger.warning("First batch is empty or no valid recalls computed, skipping diagnostic recall@50")
         
         reranked_batch = [cands[:k_final] for cands in batch_candidates]
         
@@ -331,76 +359,137 @@ def main():
                 "stage": "before_rerank",
                 "candidates": [
                     {
-                        "chunk_id": c["chunk_id"],
-                        "doc_id": int(c["doc_id"]),
-                        "score": c["score"],
+                        "chunk_id": c.get("chunk_id", "unknown"),
+                        "doc_id": int(c.get("doc_id", 0)) if c.get("doc_id") and str(c.get("doc_id")).lower() not in ("unknown", "none", "") else 0,
+                        "score": c.get("score", 0.0),
                         "dense_score": c.get("dense_score", 0.0),
                         "bm25_score": c.get("bm25_score", 0.0)
                     }
                     for c in candidates[:k_retrieve]
+                    if c and isinstance(c, dict)
                 ]
             }
             batch_logs.append(log_entry_before)
             
-            candidates_after_rerank = reranked_candidates if reranker else None
+            candidates_after_rerank = reranked_candidates if (reranker and reranked_candidates) else None
             
-            if reranker and reranked_candidates:
+            if reranker and reranked_candidates and isinstance(reranked_candidates, list):
                 log_entry_after = {
                     "q_id": q_id,
                     "query": query_text,
                     "stage": "after_rerank",
                     "candidates": [
                         {
-                            "chunk_id": c["chunk_id"],
-                            "doc_id": int(c["doc_id"]),
+                            "chunk_id": c.get("chunk_id", "unknown"),
+                            "doc_id": int(c.get("doc_id", 0)) if c.get("doc_id") and str(c.get("doc_id")).lower() not in ("unknown", "none", "") else 0,
                             "score": c.get("rerank_score", c.get("score", 0.0))
                         }
                         for c in reranked_candidates[:k_final]
+                        if c and isinstance(c, dict)
                     ]
                 }
                 batch_logs.append(log_entry_after)
             
-            final_candidates = reranked_candidates if reranker else candidates[:k_final]
+            # Safe selection of final candidates
+            if reranker and reranked_candidates and isinstance(reranked_candidates, list) and len(reranked_candidates) > 0:
+                final_candidates = reranked_candidates
+            else:
+                final_candidates = candidates[:k_final] if candidates else []
             
-            # Deduplicate by web_id: keep best chunk per document (same as submit.py)
+            # Deduplicate by web_id: keep best chunk per document with improved scoring
             web_id_to_best_chunk = {}
             for candidate in final_candidates:
                 try:
                     doc_id = int(candidate.get("doc_id", 0))
                     if doc_id <= 0:
                         continue
-                    # Keep candidate with highest score for each web_id
+                    # Calculate combined score: prioritize rerank_score, then normalized_score, then hybrid score
+                    rerank_score = float(candidate.get("rerank_score", 0.0))
+                    normalized_score = float(candidate.get("normalized_score", 0.0))
+                    hybrid_score = float(candidate.get("score", 0.0))
+                    dense_score = float(candidate.get("dense_score", 0.0))
+                    
+                    # Weighted combination: rerank (if available) has highest weight
+                    if rerank_score > 0:
+                        combined_score = (rerank_score * 0.7 + normalized_score * 0.2 + hybrid_score * 0.1)
+                    elif normalized_score > 0:
+                        combined_score = (normalized_score * 0.6 + hybrid_score * 0.4)
+                    else:
+                        combined_score = (hybrid_score * 0.7 + dense_score * 0.3)
+                    
+                    # Keep candidate with highest combined score for each web_id
                     if doc_id not in web_id_to_best_chunk:
+                        candidate["combined_score"] = combined_score
                         web_id_to_best_chunk[doc_id] = candidate
                     else:
-                        current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
-                        best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
-                        if current_score > best_score:
+                        best_combined = web_id_to_best_chunk[doc_id].get("combined_score", 0.0)
+                        if combined_score > best_combined:
+                            candidate["combined_score"] = combined_score
                             web_id_to_best_chunk[doc_id] = candidate
                 except (ValueError, TypeError):
                     continue
             
-            # If we still need more, fill from original candidates
+            # If we still need more, fill from original candidates with same scoring logic
             if len(web_id_to_best_chunk) < k_final:
                 for candidate in candidates:
                     try:
                         doc_id = int(candidate.get("doc_id", 0))
                         if doc_id <= 0 or doc_id in web_id_to_best_chunk:
                             continue
+                        # Calculate combined score using same logic
+                        rerank_score = float(candidate.get("rerank_score", 0.0))
+                        normalized_score = float(candidate.get("normalized_score", 0.0))
+                        hybrid_score = float(candidate.get("score", 0.0))
+                        dense_score = float(candidate.get("dense_score", 0.0))
+                        
+                        if rerank_score > 0:
+                            combined_score = (rerank_score * 0.7 + normalized_score * 0.2 + hybrid_score * 0.1)
+                        elif normalized_score > 0:
+                            combined_score = (normalized_score * 0.6 + hybrid_score * 0.4)
+                        else:
+                            combined_score = (hybrid_score * 0.7 + dense_score * 0.3)
+                        
+                        candidate["combined_score"] = combined_score
                         web_id_to_best_chunk[doc_id] = candidate
                         if len(web_id_to_best_chunk) >= k_final:
                             break
                     except (ValueError, TypeError):
                         continue
             
-            # Sort by score and take top-k
+            # Sort by combined score (or fallback to rerank_score/score) and take top-k
             deduped_candidates = sorted(
                 web_id_to_best_chunk.values(),
-                key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
+                key=lambda c: (
+                    c.get("combined_score", 0.0),
+                    float(c.get("rerank_score", 0.0)),
+                    float(c.get("normalized_score", 0.0)),
+                    float(c.get("score", 0.0))
+                ),
                 reverse=True
             )[:k_final]
             
-            web_ids = [int(c["doc_id"]) for c in deduped_candidates]
+            # Safely extract web_ids with error handling
+            web_ids = []
+            for c in deduped_candidates:
+                try:
+                    doc_id = c.get("doc_id")
+                    if doc_id is None:
+                        continue
+                    # Try to convert to int, handle string numbers and "unknown"
+                    if isinstance(doc_id, int):
+                        web_id = doc_id
+                    elif isinstance(doc_id, str):
+                        if doc_id.lower() in ("unknown", "none", ""):
+                            continue
+                        web_id = int(doc_id)
+                    else:
+                        web_id = int(doc_id)
+                    
+                    if web_id > 0:
+                        web_ids.append(web_id)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+            
             # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
             while len(web_ids) < k_final:
                 if web_ids:
